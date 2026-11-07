@@ -93,6 +93,7 @@ Use `-Command`, not `-File`, when passing a credential or secret. Write
 | `-IncludeTrend` | Day-by-day unique users and peak concurrency. |
 | `-Anonymize` | Replace names with `User-0001` style pseudonyms. Counts are unchanged. |
 | `-ExportRawData` | Also write `data.json`, `summary.csv`, `sessions.csv` and `daily-trend.csv`. |
+| `-FetchConcurrency 1-8` | Requests to the Monitor Service at once. Default 4. Use 1 to send one at a time. |
 | `-NoGui` | Run without the dialog. |
 | `-DemoData` | Synthetic data. Contacts nothing. |
 
@@ -125,6 +126,9 @@ the find-a-user helper.
 - **A truncation banner means a lower bound.** Citrix keeps session history
   for 90 days on Premium, 31 on Advanced and 7 on other editions. A window
   longer than that is marked, and the true figure is higher than shown.
+- **"Lower bound: session data incomplete"** under the figures means the
+  script could not read every session. It is very unlikely from 1.14.4 on.
+  If you see it, send `usage-report.log` with the report.
 
 ## Combining several sites
 
@@ -217,6 +221,7 @@ sessions. By default only the latest run for each site is searched. Tick
 | **"Citrix Cloud rejected the credentials"** | Check the customer ID, client ID and secret. Secrets are shown once; create a new one if it has been lost. |
 | **TLS certificate trust failure** | This machine does not trust the controller's certificate. Run from a domain-joined machine, or install the issuing root certificate. |
 | **"Set-ReportCancellation is not recognized"** | Fixed in 1.14.3. On older versions, save the script as a file and run that file. |
+| **Peak far lower than Director shows, and the same for 30, 60 and 90 days** | Fixed in 1.14.4. Earlier versions stopped reading after 500,000 records on some large sites. Run the report again with 1.14.4. |
 | **"No sessions were returned"** | The run worked but found no sessions. Check the account's access scope and compare with Director for the same period. |
 
 Every error also appears in `usage-report.log` in the run folder.

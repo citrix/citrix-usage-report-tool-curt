@@ -1,8 +1,8 @@
 ﻿#requires -Version 5.1
 # ============================================================================
 #  Citrix Usage Report - GENERATED FILE, DO NOT EDIT DIRECTLY
-#  Version: 1.14.3
-#  Built  : 2026-11-06T17:27:08Z
+#  Version: 1.15.0
+#  Built  : 2026-11-07T08:27:07Z
 #  Source : https://github.com/citrix/citrix-usage-report-tool-curt
 # ============================================================================
 
@@ -108,6 +108,11 @@
 .PARAMETER DemoData
     Generate a synthetic dataset instead of contacting Citrix. Use this to
     preview the report without an environment.
+
+.PARAMETER FetchConcurrency
+    How many requests to the Monitor Service may run at once, 1 to 8. The
+    default, 4, makes a large site's fetch several times faster. Use 1 to
+    send one request at a time, as versions before 1.14.4 did.
 
 .PARAMETER ExportForMerge
     Also write merge-export.json, this site's contribution to a report that
@@ -281,6 +286,10 @@ param(
     # between sites and is kept for years.
     [switch] $AllowUnanonymizedMergeExport,
 
+    # Requests in flight at once while fetching. See Invoke-CitrixODataSlicedQuery.
+    [ValidateRange(1, 8)]
+    [int] $FetchConcurrency = 4,
+
     # Consolidate several merge exports into one report instead of contacting
     # a Citrix site. Accepts file paths, or directories to search for
     # merge-export.json.
@@ -326,8 +335,8 @@ param(
 # placeholders in place. That reports as a development build rather than
 # claiming a release number it has not been through the build for.
 # ---------------------------------------------------------------------------
-$script:ReportVersion = '1.14.3'
-$script:ReportBuiltUtc = '2026-11-06T17:27:08Z'
+$script:ReportVersion = '1.15.0'
+$script:ReportBuiltUtc = '2026-11-07T08:27:07Z'
 
 # Where this script lives, captured while $PSCommandPath is still in scope.
 #
@@ -958,7 +967,10 @@ function New-ReportConfig {
         [switch] $IncludeTrend,
         [switch] $Anonymize,
         [switch] $ExportRawData,
-        [switch] $DemoData
+        [switch] $DemoData,
+
+        # Requests in flight at once while fetching (Invoke-CitrixODataSlicedQuery).
+        [ValidateRange(1, 8)][int] $FetchConcurrency = 4
     )
 
     $mergeList = @($MergePaths | Where-Object { $_ })
@@ -1045,6 +1057,7 @@ function New-ReportConfig {
         IdentityMapPath       = $IdentityMapPath
         ExportRawData         = [bool] $ExportRawData
         DemoData              = [bool] $DemoData
+        FetchConcurrency      = $FetchConcurrency
     }
 }
 
@@ -1295,13 +1308,29 @@ function Get-AuthRequestParameters {
 #  the on-premises and cloud differences out of this file entirely.
 # ============================================================================
 
-# The Monitor API returns at most 1000 records per page, which is why
-# Invoke-CitrixODataQuery must follow @odata.nextLink rather than assume a
-# single page holds everything.
+# The Monitor API pages its results, which is why Invoke-CitrixODataQuery
+# must follow @odata.nextLink rather than assume a single page holds
+# everything. The page size is the server's choice, not ours: on-premises
+# sites have been seen returning 100 records a page, not the 1000 once
+# assumed here.
 
 # Status codes worth retrying. Anything else is a permanent failure and
 # retrying it only delays the error the user needs to see.
 $script:ODataRetryableStatus = @(408, 429, 500, 502, 503, 504)
+
+# The most records one query will read before it stops and warns. A
+# backstop against a server that never stops paging, NOT a size any real
+# site should reach, so it is counted in records rather than pages: the
+# page size varies by site, and a page limit of 5000 stopped a real
+# on-premises site at 500,000 sessions (100 a page). That kept a random
+# third of a 90-day pull and reported a peak of about 2,400 against a
+# true 6,925. A repeating page link is caught separately, below.
+$script:ODataMaxRecords = 25000000
+
+# Attempts per page before a transient failure ends the run. A large site
+# reads tens of thousands of pages, so one network blip lasting a minute
+# must not be fatal: eight attempts back off for about two minutes in all.
+$script:ODataMaxAttempts = 8
 
 # Records every fetch that came back knowingly incomplete. Truncation used to
 # be written to usage-report.log and nowhere else, so an under-counted device or
@@ -1356,6 +1385,26 @@ function Get-ODataFetchWarnings {
     [OutputType([object[]])]
     param()
     return $script:ODataFetchWarnings.ToArray()
+}
+
+function Test-SessionFetchIncomplete {
+    <#
+    .SYNOPSIS
+        Whether a run's warnings say its sessions were not all read.
+    .DESCRIPTION
+        Every headline figure -- unique users, peak and percentile
+        concurrency, total sessions -- comes from Sessions, so an incomplete
+        Sessions fetch makes all of them a lower bound. Takes the warning
+        list rather than reading the run's log, so it works as well on the
+        warnings saved in data.json or carried by a consolidation.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([AllowEmptyCollection()][AllowNull()] $Warnings)
+
+    return [bool] @($Warnings | Where-Object {
+        $_ -and $_.PSObject.Properties['Entity'] -and $_.Entity -eq 'Sessions'
+    }).Count
 }
 
 function New-ODataHttpError {
@@ -1805,20 +1854,29 @@ function Invoke-CitrixODataQuery {
         [string] $Filter,
         [string] $OrderBy,
         [int] $Top,
-        [int] $MaxRecords = 0,
+        [int] $MaxRecords = $script:ODataMaxRecords,
         [scriptblock] $ProgressAction,
-        [int] $MaxAttempts = 5,
+        [int] $MaxAttempts = $script:ODataMaxAttempts,
         [scriptblock] $CancellationCheck,
 
-        # Defensive backstop against a server that never terminates paging.
-        # A few thousand pages is far beyond any real Citrix site at 1000
-        # records per page.
-        [int] $MaxPages = 5000
+        # 0 means no page limit, the default: MaxRecords is the backstop,
+        # because the page size is the server's and varies by site. Kept so
+        # a caller (and the tests) can still bound a query by pages.
+        [int] $MaxPages = 0,
+
+        # A page to start from instead of the query's first page: where a
+        # concurrent fetch (Invoke-CitrixODataSlicedQuery) hands over a slice
+        # whose page failed, so the retries and error messages here apply to
+        # it unchanged.
+        [string] $StartUrl
     )
 
     $results = New-Object System.Collections.Generic.List[object]
-    $url = Build-ODataUrl -Base $AuthContext.ODataBase -Entity $Entity `
-        -Select $Select -Filter $Filter -OrderBy $OrderBy -Top $Top
+    $url = $StartUrl
+    if (-not $url) {
+        $url = Build-ODataUrl -Base $AuthContext.ODataBase -Entity $Entity `
+            -Select $Select -Filter $Filter -OrderBy $OrderBy -Top $Top
+    }
     $page = 0
     $refreshedOn401 = $false
 
@@ -1951,6 +2009,11 @@ function Invoke-CitrixODataQuery {
 
         if ($ProgressAction) { & $ProgressAction $Entity $results.Count }
 
+        # A page that arrived means the credentials work, so a later 401 is
+        # a token that expired since, which earns its own refresh. One
+        # refresh per query would fail any query outlasting two tokens.
+        $refreshedOn401 = $false
+
         if ($MaxRecords -gt 0 -and $results.Count -ge $MaxRecords) {
             Write-ReportLog -Level Warn -Message "Reached the $MaxRecords record cap for $Entity; results are truncated."
             Add-ODataFetchWarning -Entity $Entity -Reason 'RecordCap' -RecordCount $results.Count `
@@ -1958,7 +2021,7 @@ function Invoke-CitrixODataQuery {
             break
         }
 
-        if ($page -ge $MaxPages) {
+        if ($MaxPages -gt 0 -and $page -ge $MaxPages) {
             Write-ReportLog -Level Warn -Message "Reached the maximum of $MaxPages page(s) fetching $Entity without the server signalling completion; stopping to avoid an unbounded run. Results may be incomplete."
             Add-ODataFetchWarning -Entity $Entity -Reason 'PageCap' -RecordCount $results.Count `
                 -Message "The server was still returning $Entity pages after $MaxPages page(s) ($($results.Count) record(s)), so the fetch was stopped. Pages do not arrive in time order, so the records that were dropped are an arbitrary subset."
@@ -1996,6 +2059,210 @@ function Invoke-CitrixODataQuery {
     return $results.ToArray()
 }
 
+# How many page requests a sliced fetch keeps in flight. The Monitor
+# service answers each page from SQL, so most of a large fetch is spent
+# waiting on the server, not working here: a 489,000-session pull spent 21
+# minutes at 261 ms a page. A few requests in flight overlap that waiting.
+# Four is modest next to what Director itself issues, and a run can lower it.
+$script:ODataDefaultConcurrency = 4
+
+function Invoke-CitrixODataSlicedQuery {
+    <#
+    .SYNOPSIS
+        Runs one query as several disjoint slices, with up to -Concurrency
+        page requests in flight at once.
+    .DESCRIPTION
+        Each filter in -Filters must select records no other filter selects,
+        and together they must select exactly what the single query would;
+        the caller builds them (see Get-ODataTimeSlices). Records come back
+        in no particular order.
+
+        Slicing helps even one request at a time: each slice pages from its
+        own start, so no page has to skip past a whole window's records.
+
+        Only the HTTP request runs in the background. Paging, the record
+        backstop, the repeating-link guard, cancellation and the fetch
+        warnings all stay here, on the calling thread. The first page that
+        fails in a slice hands the rest of that slice to
+        Invoke-CitrixODataQuery, so retries, token refreshes and every error
+        message are exactly the one-page-at-a-time ones.
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory)] $AuthContext,
+        [Parameter(Mandatory)][string] $Entity,
+        [string[]] $Select,
+        [Parameter(Mandatory)][string[]] $Filters,
+        [int] $Concurrency = $script:ODataDefaultConcurrency,
+        [int] $MaxRecords = $script:ODataMaxRecords,
+        [scriptblock] $ProgressAction,
+        [scriptblock] $CancellationCheck
+    )
+
+    $results = New-Object System.Collections.Generic.List[object]
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $pages = 0
+    Write-ReportLog -Level Debug -Message "OData GET $Entity in $($Filters.Count) slice(s), up to $Concurrency request(s) at a time"
+
+    # True once the record backstop is reached, warning the first time.
+    # Reached between slices, not inside one, so Invoke-CitrixODataQuery's
+    # own cap does not see it.
+    function Test-SliceCapReached {
+        if ($MaxRecords -le 0 -or $results.Count -lt $MaxRecords) { return $false }
+        $already = @(Get-ODataFetchWarnings | Where-Object { $_.Entity -eq $Entity -and $_.Reason -eq 'RecordCap' })
+        if ($already.Count -eq 0) {
+            Write-ReportLog -Level Warn -Message "Reached the $MaxRecords record cap for $Entity; results are truncated."
+            Add-ODataFetchWarning -Entity $Entity -Reason 'RecordCap' -RecordCount $results.Count `
+                -Message "Only the first $($results.Count) $Entity record(s) were read before the record cap was reached, and pages do not arrive in time order, so the records that were dropped are an arbitrary subset."
+        }
+        return $true
+    }
+
+    # Reads the rest of one slice through the one-page-at-a-time loop, from
+    # the slice's first page or from the page that just failed.
+    function Read-SliceSequentially([string] $SliceFilter, [string] $From) {
+        $base = $results.Count
+        $progress = $null
+        if ($ProgressAction) {
+            $outer = $ProgressAction
+            $progress = { param($e, $n) & $outer $e ($base + $n) }.GetNewClosure()
+        }
+        # Never 0 here: to Invoke-CitrixODataQuery, 0 means no cap at all.
+        $remaining = 0
+        if ($MaxRecords -gt 0) { $remaining = [math]::Max(1, $MaxRecords - $results.Count) }
+        $batch = @(Invoke-CitrixODataQuery -AuthContext $AuthContext -Entity $Entity -Select $Select `
+            -Filter $SliceFilter -StartUrl $From -MaxRecords $remaining `
+            -ProgressAction $progress -CancellationCheck $CancellationCheck)
+        foreach ($item in $batch) { [void] $results.Add($item) }
+    }
+
+    if ($Concurrency -le 1) {
+        foreach ($f in $Filters) {
+            if (Test-SliceCapReached) { break }
+            Read-SliceSequentially $f $null
+            if ($CancellationCheck -and (& $CancellationCheck)) { break }
+        }
+        Write-ReportLog -Level Debug -Message "$Entity : $($results.Count) record(s) in $([int] $sw.Elapsed.TotalSeconds) s."
+        return $results.ToArray()
+    }
+
+    # A ServicePoint allows two connections to one host unless told
+    # otherwise, which would queue every request past the second. Raised
+    # for this host only, never lowered.
+    $servicePoint = [System.Net.ServicePointManager]::FindServicePoint([uri] $AuthContext.ODataBase)
+    if ($servicePoint.ConnectionLimit -lt $Concurrency) { $servicePoint.ConnectionLimit = $Concurrency }
+
+    # The whole of what runs in the background: one GET. A failure comes
+    # back as a value, never as an exception across the runspace boundary.
+    $get = {
+        param($Url, $Headers, $Extra)
+        try {
+            $r = Invoke-RestMethod -Uri $Url -Method Get -Headers $Headers -UseBasicParsing `
+                -TimeoutSec 300 -ErrorAction Stop @Extra
+            [pscustomobject]@{ Ok = $true; Response = $r }
+        } catch {
+            [pscustomobject]@{ Ok = $false; Response = $null }
+        }
+    }.ToString()
+
+    # A slice is its next page and the pages it has already asked for. A
+    # slice whose next page is known goes to the FRONT, so slices are
+    # finished one after another rather than all opened at once.
+    $ready = New-Object System.Collections.Generic.List[object]
+    foreach ($f in $Filters) {
+        $ready.Add([pscustomobject]@{
+            Filter = $f
+            Url    = Build-ODataUrl -Base $AuthContext.ODataBase -Entity $Entity -Select $Select -Filter $f
+            Seen   = New-Object 'System.Collections.Generic.HashSet[string]'
+        })
+    }
+    $active = New-Object System.Collections.Generic.List[object]
+    $pool = [runspacefactory]::CreateRunspacePool(1, $Concurrency)
+    $pool.Open()
+    $stopped = $false
+
+    try {
+        while (-not $stopped -and ($ready.Count -gt 0 -or $active.Count -gt 0)) {
+
+            while ($active.Count -lt $Concurrency -and $ready.Count -gt 0) {
+                $slice = $ready[0]
+                $ready.RemoveAt(0)
+                [void] $slice.Seen.Add($slice.Url)
+                $ps = [powershell]::Create()
+                $ps.RunspacePool = $pool
+                [void] $ps.AddScript($get)
+                [void] $ps.AddArgument($slice.Url)
+                [void] $ps.AddArgument($AuthContext.GetHeaders())
+                [void] $ps.AddArgument((Get-AuthRequestParameters -AuthContext $AuthContext))
+                $active.Add([pscustomobject]@{ Slice = $slice; PS = $ps; Handle = $ps.BeginInvoke() })
+            }
+
+            # Bounded, so Cancel is noticed within half a second however
+            # slow the server is.
+            $handles = [System.Threading.WaitHandle[]] @($active | ForEach-Object { $_.Handle.AsyncWaitHandle })
+            $done = [System.Threading.WaitHandle]::WaitAny($handles, 500)
+
+            Assert-NotCancelled
+            if ($CancellationCheck -and (& $CancellationCheck)) {
+                Write-ReportLog -Level Warn -Message "Canceled while fetching $Entity after $($results.Count) records."
+                break
+            }
+            if ($done -eq [System.Threading.WaitHandle]::WaitTimeout) { continue }
+
+            $job = $active[$done]
+            $active.RemoveAt($done)
+            $out = @($job.PS.EndInvoke($job.Handle))
+            $job.PS.Dispose()
+            $slice = $job.Slice
+            $r = $null
+            if ($out.Count -gt 0) { $r = $out[0] }
+
+            if (-not $r -or -not $r.Ok) {
+                Write-ReportLog -Level Debug -Message "A $Entity page failed; reading the rest of that slice one page at a time, with retries."
+                Read-SliceSequentially $slice.Filter $slice.Url
+                if ((Test-SliceCapReached) -or ($CancellationCheck -and (& $CancellationCheck))) { $stopped = $true }
+                continue
+            }
+
+            $pages++
+            foreach ($item in @($r.Response.value)) { [void] $results.Add($item) }
+            if ($ProgressAction) { & $ProgressAction $Entity $results.Count }
+
+            # The rate, so a slow server shows in the run log rather than
+            # being guessed at from the start and end times.
+            if ($pages % 500 -eq 0) {
+                Write-ReportLog -Level Debug -Message ('{0} : {1} record(s) over {2} page(s) so far, {3:N0} ms a page' -f `
+                    $Entity, $results.Count, $pages, ($sw.Elapsed.TotalMilliseconds / $pages))
+            }
+
+            if (Test-SliceCapReached) { $stopped = $true; continue }
+
+            $next = $r.Response.PSObject.Properties['@odata.nextLink']
+            if (-not $next) { continue }
+            if ($slice.Seen.Contains($next.Value)) {
+                Write-ReportLog -Level Warn -Message "The server returned a repeating pagination link while fetching $Entity; stopping to avoid an infinite loop. Results may be incomplete."
+                Add-ODataFetchWarning -Entity $Entity -Reason 'RepeatingPageLink' -RecordCount $results.Count `
+                    -Message "The server returned a repeating pagination link while fetching $Entity, so the fetch was stopped after $($results.Count) record(s) to avoid an infinite loop."
+                continue
+            }
+            $slice.Url = $next.Value
+            $ready.Insert(0, $slice)
+        }
+    } finally {
+        foreach ($job in $active) {
+            try { $job.PS.Stop() } catch { }
+            $job.PS.Dispose()
+        }
+        $pool.Close()
+        $pool.Dispose()
+    }
+
+    Write-ReportLog -Level Debug -Message ('{0} : {1} record(s) over {2} page(s) in {3} s.' -f `
+        $Entity, $results.Count, $pages, [int] $sw.Elapsed.TotalSeconds)
+    return $results.ToArray()
+}
+
 # endregion 40-ODataClient.ps1
 
 # ----------------------------------------------------------------------------
@@ -2026,19 +2293,85 @@ function ConvertTo-UtcDateTime {
     [CmdletBinding()]
     param([AllowNull()] $Value)
 
+    ConvertTo-UtcDateTimeCore $Value
+}
+
+$script:UtcParseStyles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor
+                         [System.Globalization.DateTimeStyles]::AssumeUniversal
+
+function ConvertTo-UtcDateTimeCore($Value) {
+    # A PLAIN function for the same reason as Get-ClampedSessionIntervalCore:
+    # it runs twice per session, and the advanced-function parameter binder
+    # was most of the 1.7 minutes spent converting 489,000 sessions.
     if ($null -eq $Value -or $Value -eq '') { return $null }
     if ($Value -is [datetime]) {
-        return $(if ($Value.Kind -eq [System.DateTimeKind]::Utc) { $Value } else { $Value.ToUniversalTime() })
+        if ($Value.Kind -eq [System.DateTimeKind]::Utc) { return $Value }
+        return $Value.ToUniversalTime()
     }
 
     $parsed = [datetime]::MinValue
-    $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor
-              [System.Globalization.DateTimeStyles]::AssumeUniversal
     if ([datetime]::TryParse([string] $Value, [System.Globalization.CultureInfo]::InvariantCulture,
-            $styles, [ref] $parsed)) {
+            $script:UtcParseStyles, [ref] $parsed)) {
         return [datetime]::SpecifyKind($parsed, [System.DateTimeKind]::Utc)
     }
     return $null
+}
+
+function Get-ODataTimeSlices {
+    <#
+    .SYNOPSIS
+        Cuts a period into consecutive slices of -Hours, the last one short.
+    .DESCRIPTION
+        For a sliced fetch (Invoke-CitrixODataSlicedQuery). Each slice is
+        [FromUtc, ToUtc): the slices touch end to end, never overlap and
+        leave no gap, so filters built from them select each record once.
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory)][datetime] $StartUtc,
+        [Parameter(Mandatory)][datetime] $EndUtc,
+        [ValidateRange(1, 8760)][int] $Hours = 24
+    )
+
+    $slices = New-Object System.Collections.Generic.List[object]
+    $from = $StartUtc
+    while ($from -lt $EndUtc) {
+        $to = $from.AddHours($Hours)
+        if ($to -gt $EndUtc) { $to = $EndUtc }
+        $slices.Add([pscustomobject]@{ FromUtc = $from; ToUtc = $to })
+        $from = $to
+    }
+    return $slices.ToArray()
+}
+
+function Get-SessionSliceFilters {
+    <#
+    .SYNOPSIS
+        Get-SessionOverlapFilter's query, cut into one filter per day.
+    .DESCRIPTION
+        One filter for sessions that started before the window and are still
+        inside it -- persistent desktops, which can run for weeks -- then one
+        per day of starts. Each keeps the overlap condition, so together they
+        select exactly what the single overlap filter does, each session once.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory)][datetime] $StartUtc,
+        [Parameter(Mandatory)][datetime] $EndUtc
+    )
+
+    $s = ConvertTo-ODataDateLiteral -Utc $StartUtc
+    $overlap = "(EndDate eq null or EndDate gt $s)"
+    $filters = New-Object System.Collections.Generic.List[string]
+    $filters.Add("$overlap and StartDate lt $s")
+    foreach ($slice in @(Get-ODataTimeSlices -StartUtc $StartUtc -EndUtc $EndUtc)) {
+        $a = ConvertTo-ODataDateLiteral -Utc $slice.FromUtc
+        $b = ConvertTo-ODataDateLiteral -Utc $slice.ToUtc
+        $filters.Add("$overlap and StartDate ge $a and StartDate lt $b")
+    }
+    return $filters.ToArray()
 }
 
 function Get-SessionOverlapFilter {
@@ -2211,23 +2544,56 @@ function Get-CitrixSessionRecords {
         [scriptblock] $CancellationCheck
     )
 
-    $filter = Get-SessionOverlapFilter -StartUtc $Config.WidestWindowStartUtc -EndUtc $Config.WindowEndUtc
+    # One query per day of starts rather than one for the whole window: see
+    # Invoke-CitrixODataSlicedQuery for why that is faster even one request
+    # at a time.
+    $filters = Get-SessionSliceFilters -StartUtc $Config.WidestWindowStartUtc -EndUtc $Config.WindowEndUtc
 
-    $raw = Invoke-CitrixODataQuery -AuthContext $AuthContext -Entity 'Sessions' `
+    $raw = Invoke-CitrixODataSlicedQuery -AuthContext $AuthContext -Entity 'Sessions' `
         -Select @('SessionKey','UserId','MachineId','StartDate','EndDate','SessionType','IsAnonymous','ConnectionState','LifecycleState') `
-        -Filter $filter -ProgressAction $ProgressAction -CancellationCheck $CancellationCheck
+        -Filters $filters -Concurrency (Get-ReportFetchConcurrency -Config $Config) `
+        -ProgressAction $ProgressAction -CancellationCheck $CancellationCheck
 
+    # Once per session key. The slices cannot overlap, but a page boundary
+    # can still shift under a live site -- a session added mid-fetch moves
+    # every later row of its slice down one -- and a session counted twice
+    # would add a phantom one to the peak.
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
     foreach ($r in $raw) {
+        $key = [string] $r.SessionKey
+        # A blank key identifies nothing, so it is never taken as a repeat.
+        if ($key -and -not $seen.Add($key)) { continue }
+        $type = 0
+        if ($null -ne $r.SessionType) { $type = [int] $r.SessionType }
         [pscustomobject]@{
-            SessionKey  = [string] $r.SessionKey
+            SessionKey  = $key
             UserId      = [string] $r.UserId
             MachineId   = [string] $r.MachineId
-            StartUtc    = ConvertTo-UtcDateTime -Value $r.StartDate
-            EndUtc      = ConvertTo-UtcDateTime -Value $r.EndDate
-            SessionType = [int] ($(if ($null -ne $r.SessionType) { $r.SessionType } else { 0 }))
+            StartUtc    = ConvertTo-UtcDateTimeCore $r.StartDate
+            EndUtc      = ConvertTo-UtcDateTimeCore $r.EndDate
+            SessionType = $type
             IsAnonymous = [bool] $r.IsAnonymous
         }
     }
+}
+
+function Get-ReportFetchConcurrency {
+    <#
+    .SYNOPSIS
+        How many requests at once this run's fetch may use.
+    .DESCRIPTION
+        Read from the config, falling back to the default for a config built
+        before the setting existed (tests and older callers build them by
+        hand).
+    #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param([Parameter(Mandatory)][pscustomobject] $Config)
+
+    if ($Config.PSObject.Properties['FetchConcurrency'] -and $Config.FetchConcurrency -ge 1) {
+        return [int] $Config.FetchConcurrency
+    }
+    return $script:ODataDefaultConcurrency
 }
 
 function Get-CitrixLookupRecords {
@@ -2245,11 +2611,22 @@ function Get-CitrixLookupRecords {
         [Parameter(Mandatory)][string] $Entity,
         [Parameter(Mandatory)][string[]] $Fields,
         [string] $Filter,
-        [scriptblock] $ProgressAction
+        [scriptblock] $ProgressAction,
+
+        # Disjoint slices of one query, fetched by Invoke-CitrixODataSlicedQuery
+        # instead of the single -Filter. For the large session-linked
+        # entities; the small lookups never need it.
+        [string[]] $Filters,
+        [int] $Concurrency = 1
     )
 
-    $raw = Invoke-CitrixODataQuery -AuthContext $AuthContext -Entity $Entity `
-        -Select $Fields -Filter $Filter -ProgressAction $ProgressAction
+    if ($Filters) {
+        $raw = Invoke-CitrixODataSlicedQuery -AuthContext $AuthContext -Entity $Entity `
+            -Select $Fields -Filters $Filters -Concurrency $Concurrency -ProgressAction $ProgressAction
+    } else {
+        $raw = Invoke-CitrixODataQuery -AuthContext $AuthContext -Entity $Entity `
+            -Select $Fields -Filter $Filter -ProgressAction $ProgressAction
+    }
 
     foreach ($r in $raw) {
         $o = [ordered]@{}
@@ -2291,6 +2668,28 @@ function Get-SessionLinkedWindowFilter {
     return "$DateField ge $s and $DateField lt $e"
 }
 
+function Get-SessionLinkedSliceFilters {
+    <#
+    .SYNOPSIS
+        Get-SessionLinkedWindowFilter's bound, cut into one filter per day.
+    .DESCRIPTION
+        The days touch end to end, so together the filters select exactly
+        what the single bound does, each record once.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory)][string] $DateField,
+        [Parameter(Mandatory)][datetime] $StartUtc,
+        [Parameter(Mandatory)][datetime] $EndUtc
+    )
+
+    $filters = foreach ($slice in @(Get-ODataTimeSlices -StartUtc $StartUtc -EndUtc $EndUtc)) {
+        Get-SessionLinkedWindowFilter -DateField $DateField -StartUtc $slice.FromUtc -EndUtc $slice.ToUtc
+    }
+    return [string[]] @($filters)
+}
+
 function Get-CitrixWindowedRecords {
     <#
     .SYNOPSIS
@@ -2321,15 +2720,26 @@ function Get-CitrixWindowedRecords {
         [Parameter(Mandatory)][string] $Entity,
         [Parameter(Mandatory)][string[]] $Fields,
         [string] $Filter,
-        [scriptblock] $ProgressAction
+        [scriptblock] $ProgressAction,
+
+        # The same bound cut into disjoint slices (Get-SessionLinkedSliceFilters),
+        # used instead of -Filter when given.
+        [string[]] $Filters,
+        [int] $Concurrency = 1
     )
 
-    if ([string]::IsNullOrWhiteSpace($Filter)) {
+    if ($Filters) {
+        $Filter = $Filters[0]
+    } elseif ([string]::IsNullOrWhiteSpace($Filter)) {
         return @(Get-CitrixLookupRecords -AuthContext $AuthContext -Entity $Entity `
             -Fields $Fields -ProgressAction $ProgressAction)
     }
 
     try {
+        if ($Filters) {
+            return @(Get-CitrixLookupRecords -AuthContext $AuthContext -Entity $Entity `
+                -Fields $Fields -Filters $Filters -Concurrency $Concurrency -ProgressAction $ProgressAction)
+        }
         return @(Get-CitrixLookupRecords -AuthContext $AuthContext -Entity $Entity `
             -Fields $Fields -Filter $Filter -ProgressAction $ProgressAction)
     } catch {
@@ -2393,10 +2803,32 @@ function Get-CitrixDataset {
     # With no sessions at all there is nothing to join to, so the widest
     # requested window is used instead.
     $linkedStartUtc = $Config.WidestWindowStartUtc
-    if ($sessions.Count -gt 0) {
-        $earliest = ($sessions | Where-Object { $_.StartUtc } |
-            Measure-Object -Property StartUtc -Minimum).Minimum
-        if ($earliest) { $linkedStartUtc = $earliest }
+    # A plain loop: the Where-Object | Measure-Object pipeline this replaced
+    # took 2.2 minutes over 489,000 sessions.
+    $earliest = $null
+    foreach ($s in $sessions) {
+        $t = $s.StartUtc
+        if ($t -and ($null -eq $earliest -or $t -lt $earliest)) { $earliest = $t }
+    }
+    if ($earliest) { $linkedStartUtc = $earliest }
+
+    # One slice for anything launched before the window -- the launches of
+    # long-running desktops, few however far back they go -- then a slice a
+    # day across the window itself.
+    $concurrency = Get-ReportFetchConcurrency -Config $Config
+    $linkedSlices = {
+        param([string] $DateField)
+        $windowStart = $Config.WidestWindowStartUtc
+        $all = New-Object System.Collections.Generic.List[string]
+        if ($linkedStartUtc -lt $windowStart) {
+            $all.Add((Get-SessionLinkedWindowFilter -DateField $DateField -StartUtc $linkedStartUtc -EndUtc $windowStart))
+        } else {
+            $windowStart = $linkedStartUtc
+        }
+        foreach ($f in @(Get-SessionLinkedSliceFilters -DateField $DateField -StartUtc $windowStart -EndUtc $Config.WindowEndUtc)) {
+            $all.Add($f)
+        }
+        return [string[]] $all.ToArray()
     }
 
     $connections = @()
@@ -2407,8 +2839,7 @@ function Get-CitrixDataset {
         # for what happens if this site does not know that field.
         $connections = @(Get-CitrixWindowedRecords -AuthContext $AuthContext -Entity 'Connections' `
             -Fields @('Id','SessionKey','ClientName','ClientAddress','ClientVersion','IsReconnect') `
-            -Filter (Get-SessionLinkedWindowFilter -DateField 'EstablishmentDate' `
-                -StartUtc $linkedStartUtc -EndUtc $Config.WindowEndUtc) `
+            -Filters (& $linkedSlices 'EstablishmentDate') -Concurrency $concurrency `
             -ProgressAction $ProgressAction)
     }
 
@@ -2430,8 +2861,7 @@ function Get-CitrixDataset {
         # is unaffected.
         $appInstances = @(Get-CitrixWindowedRecords -AuthContext $AuthContext -Entity 'ApplicationInstances' `
             -Fields @('Id','SessionKey','ApplicationId') `
-            -Filter (Get-SessionLinkedWindowFilter -DateField 'StartDate' `
-                -StartUtc $linkedStartUtc -EndUtc $Config.WindowEndUtc) `
+            -Filters (& $linkedSlices 'StartDate') -Concurrency $concurrency `
             -ProgressAction $ProgressAction)
         $applications = @(Get-CitrixLookupRecords -AuthContext $AuthContext -Entity 'Applications' `
             -Fields @('Id','Name','PublishedName') -ProgressAction $ProgressAction)
@@ -4158,6 +4588,229 @@ function Get-ClampedSessionIntervalCore($Session, $WindowStartUtc, $WindowEndUtc
     [pscustomobject]@{ StartUtc = $start; EndUtc = $end }
 }
 
+function New-WindowSessionView {
+    <#
+    .SYNOPSIS
+        The sessions inside one window, clamped once, as tick arrays.
+    .DESCRIPTION
+        Every figure for a window reads this instead of clamping each session
+        again. Before it, a window made about ten full passes over every
+        session, each calling Get-ClampedSessionIntervalCore and building an
+        object per session: 11.8 minutes for one 30-day window of 489,000
+        sessions.
+
+        Holds, for each session the window keeps:
+          Sessions     the session itself
+          Start, End   its interval clamped to the window, in ticks
+          RawStart,    its interval clamped only to the moment the site was
+          RawEnd       observed, so a narrower window (one day of the daily
+                       trend) can be cut from it exactly as from the session
+
+        The rule is Get-ClampedSessionIntervalCore's, written out on ticks
+        because a call per session is the cost this exists to remove: a null
+        start drops the session; a null end means still open, so the
+        observed moment; nothing counts past that moment; the interval is
+        clamped to the window; and an empty interval is dropped, because
+        [start, end) is half-open. A test pins the two to the same answers.
+
+        Callers validate the window first, as for the Core function.
+    #>
+    param($Sessions, [datetime] $WindowStartUtc, [datetime] $WindowEndUtc, [datetime] $NowUtc)
+
+    $ws = $WindowStartUtc.Ticks
+    $we = $WindowEndUtc.Ticks
+    $nowTicks = $NowUtc.Ticks
+
+    $kept = New-Object System.Collections.Generic.List[object]
+    $cs = New-Object System.Collections.Generic.List[long]
+    $ce = New-Object System.Collections.Generic.List[long]
+    $rs = New-Object System.Collections.Generic.List[long]
+    $re = New-Object System.Collections.Generic.List[long]
+
+    # Cancellation is checked on a counter rather than every iteration: the
+    # counter increment and mask test below run every iteration regardless
+    # of the interval -- measured ~1.56us added per iteration, ~0.3% against
+    # the ~530us/session-iteration work rate (2,384s / 4.5M iterations,
+    # measured at 500k across the three default windows) -- and only the
+    # rare IsCancellationRequested read is gated by the interval.
+    #
+    # 0xFFFF (65,536) was wrong: that number is the CHECK's own cost over
+    # 65,536 iterations (65,536 x 1.56us =~ 0.1s), mislabelled here as the
+    # cost of the WORK between checkpoints. At the real work rate, 65,536
+    # iterations is ~35s between checkpoints -- confirmed at 26.17s on real
+    # sessions -- which leaves Cancel looking dead for half a minute against
+    # the "reacts within seconds" requirement this task exists for. 0x7FF
+    # (2,048) brings that to ~1.1s while leaving the per-iteration tax
+    # exactly where it was.
+    $cancelTick = 0
+    foreach ($s in $Sessions) {
+        if ((++$cancelTick -band 0x7FF) -eq 0 -and $script:ReportCancellationSource -and
+            $script:ReportCancellationSource.IsCancellationRequested) {
+            throw (New-Object System.OperationCanceledException 'The run was canceled.')
+        }
+        $start = $s.StartUtc
+        if (-not $start) { continue }
+        $st = $start.Ticks
+        $end = $s.EndUtc
+        $et = $nowTicks
+        if ($end) { $et = $end.Ticks }
+        if ($et -gt $nowTicks) { $et = $nowTicks }
+
+        $a = $st
+        if ($a -lt $ws) { $a = $ws }
+        $b = $et
+        if ($b -gt $we) { $b = $we }
+        if ($b -le $a) { continue }
+
+        $kept.Add($s)
+        $cs.Add($a); $ce.Add($b)
+        $rs.Add($st); $re.Add($et)
+    }
+
+    [pscustomobject]@{
+        WindowStartUtc = $WindowStartUtc
+        WindowEndUtc   = $WindowEndUtc
+        NowUtc         = $NowUtc
+        Sessions       = $kept.ToArray()
+        Start          = $cs.ToArray()
+        End            = $ce.ToArray()
+        RawStart       = $rs.ToArray()
+        RawEnd         = $re.ToArray()
+    }
+}
+
+function Select-WindowSessionView($View, $Indices) {
+    # The same view, keeping only the sessions at $Indices. For the
+    # per-group and per-type figures, which use the same window.
+    $n = @($Indices).Count
+    $sessions = New-Object 'object[]' $n
+    $cs = New-Object 'long[]' $n; $ce = New-Object 'long[]' $n
+    $rs = New-Object 'long[]' $n; $re = New-Object 'long[]' $n
+    $k = 0
+    foreach ($i in $Indices) {
+        $sessions[$k] = $View.Sessions[$i]
+        $cs[$k] = $View.Start[$i]; $ce[$k] = $View.End[$i]
+        $rs[$k] = $View.RawStart[$i]; $re[$k] = $View.RawEnd[$i]
+        $k++
+    }
+    [pscustomobject]@{
+        WindowStartUtc = $View.WindowStartUtc; WindowEndUtc = $View.WindowEndUtc; NowUtc = $View.NowUtc
+        Sessions = $sessions; Start = $cs; End = $ce; RawStart = $rs; RawEnd = $re
+    }
+}
+
+function Get-ViewUniqueUsers($View) {
+    # Get-UniqueUserStats on a view.
+    #
+    # Relies on the default ordinal-ignore-case comparer of a PowerShell
+    # hashtable literal: Citrix usernames are case-insensitive in practice
+    # (DOMAIN\alice, DOMAIN\Alice, and DOMAIN\ALICE are the same licensed
+    # person), so folding case here is required, not incidental. If this is
+    # ever swapped for a case-sensitive collection (e.g.
+    # Dictionary[string,bool]), the same person starts counting as multiple
+    # licensed users -- see the dedicated pinning test in
+    # tests/Analytics.Users.Tests.ps1.
+    $userIds = @{}
+    $anonymous = 0
+    $unattributed = 0
+    foreach ($s in $View.Sessions) {
+        if ($s.IsAnonymous) { $anonymous++; continue }
+        # A blank/null UserId that is NOT flagged IsAnonymous still happens in
+        # real Citrix exports (de-provisioned accounts, broker glitches). It
+        # must not be counted as a named user, but it must not vanish without
+        # a trace either: every in-window session lands in exactly one of the
+        # three buckets below, so attributed sessions + AnonymousSessions +
+        # UnattributedSessions == TotalSessions. UniqueUsers is NOT a term in
+        # that sum -- it counts distinct people, not sessions, and one person
+        # routinely has many sessions in a window.
+        if ([string]::IsNullOrWhiteSpace($s.UserId)) { $unattributed++; continue }
+        $userIds[$s.UserId] = $true
+    }
+    [pscustomobject]@{
+        UniqueUsers          = $userIds.Count
+        UniqueUserIds        = @($userIds.Keys)
+        AnonymousSessions    = $anonymous
+        UnattributedSessions = $unattributed
+        TotalSessions        = $View.Sessions.Count
+    }
+}
+
+function Get-TickPeak([long[]] $Start, [long[]] $End) {
+    # The sweep line of Get-PeakConcurrency, on intervals already clamped.
+    #
+    # Events are packed into a single long instead of an object per event:
+    #
+    #     key = ticks * 2 + order        order 0 = end, 1 = start
+    #
+    # Sorting the packed value sorts by instant and, within an instant, puts
+    # ends before starts -- the tie-break that stops a session ending exactly
+    # as another begins from being counted as concurrent. It is the same rule
+    # the object version expressed as a secondary sort key, not a new one.
+    #
+    # Why: this built two PSCustomObjects per session and ran Sort-Object
+    # over them -- a million objects per window at 500,000 sessions, sorted
+    # three times. [Array]::Sort over primitives does the same work without
+    # the allocation.
+    #
+    # ticks * 2 cannot overflow: DateTime.MaxValue is ~3.16e18 ticks and
+    # Int64.MaxValue is ~9.22e18.
+    $n = $Start.Count
+    if ($n -eq 0) { return [pscustomobject]@{ Peak = 0; PeakAtUtc = $null } }
+
+    $keys = New-Object 'long[]' (2 * $n)
+    for ($i = 0; $i -lt $n; $i++) {
+        $keys[2 * $i] = $End[$i] * 2
+        $keys[2 * $i + 1] = $Start[$i] * 2 + 1
+    }
+    [Array]::Sort($keys)
+
+    $current = 0; $peak = 0; $peakTicks = [long] 0
+    foreach ($key in $keys) {
+        if ($key -band 1) { $current++ } else { $current-- }
+        if ($current -gt $peak) { $peak = $current; $peakTicks = $key -shr 1 }
+    }
+
+    $peakAt = $null
+    if ($peak -gt 0) { $peakAt = [datetime]::new($peakTicks, [System.DateTimeKind]::Utc) }
+    [pscustomobject]@{ Peak = $peak; PeakAtUtc = $peakAt }
+}
+
+function Get-ViewSeries($View, [int] $IntervalMinutes) {
+    # Get-ConcurrencySeries on a view. See that function for the rules.
+    $wsUtc = $View.WindowStartUtc
+    $bucketCount = [int][math]::Ceiling(($View.WindowEndUtc - $wsUtc).TotalMinutes / $IntervalMinutes)
+    if ($bucketCount -le 0) { return @() }
+
+    # A session adds one to a run of buckets, so it is recorded at the ends
+    # of the run and summed after: a desktop open all month costs the same
+    # as a five-minute session, where adding to each bucket cost thousands.
+    $delta = New-Object 'int[]' ($bucketCount + 1)
+    $ws = $wsUtc.Ticks
+    $n = $View.Start.Count
+    for ($i = 0; $i -lt $n; $i++) {
+        # TimeSpan's TotalMinutes, exactly as the interval arithmetic before
+        # it: the same floating-point result at every bucket edge.
+        $from = [int][math]::Ceiling([TimeSpan]::new($View.Start[$i] - $ws).TotalMinutes / $IntervalMinutes)
+        $to   = [int][math]::Ceiling([TimeSpan]::new($View.End[$i]   - $ws).TotalMinutes / $IntervalMinutes) - 1
+        if ($from -lt 0) { $from = 0 }
+        if ($to -ge $bucketCount) { $to = $bucketCount - 1 }
+        if ($from -gt $to) { continue }
+        $delta[$from]++
+        $delta[$to + 1]--
+    }
+
+    $series = New-Object 'object[]' $bucketCount
+    $running = 0
+    for ($b = 0; $b -lt $bucketCount; $b++) {
+        $running += $delta[$b]
+        $series[$b] = [pscustomobject]@{
+            TimeUtc = $wsUtc.AddMinutes($b * $IntervalMinutes)
+            Count   = $running
+        }
+    }
+    return $series
+}
+
 function Get-PeakConcurrency {
     <#
     .SYNOPSIS
@@ -4181,73 +4834,8 @@ function Get-PeakConcurrency {
 
     Assert-ValidAnalyticsWindow -WindowStartUtc $WindowStartUtc -WindowEndUtc $WindowEndUtc
 
-    # Events are packed into a single long instead of an object per event:
-    #
-    #     key = ticks * 2 + order        order 0 = end, 1 = start
-    #
-    # Sorting the packed value sorts by instant and, within an instant, puts
-    # ends before starts -- the tie-break that stops a session ending exactly
-    # as another begins from being counted as concurrent. It is the same rule
-    # the object version expressed as a secondary sort key, not a new one.
-    #
-    # Why: this built two PSCustomObjects per session and ran Sort-Object
-    # over them -- a million objects per window at 500,000 sessions, sorted
-    # three times. [Array]::Sort over primitives does the same work without
-    # the allocation.
-    #
-    # ticks * 2 cannot overflow: DateTime.MaxValue is ~3.16e18 ticks and
-    # Int64.MaxValue is ~9.22e18.
-    $keys = New-Object 'System.Collections.Generic.List[long]'
-
-    # Cancellation is checked on a counter rather than every iteration: the
-    # counter increment and mask test below run every iteration regardless
-    # of the interval -- measured ~1.56us added per iteration, ~0.3% against
-    # the ~530us/session-iteration work rate (2,384s / 4.5M iterations,
-    # measured at 500k across the three default windows) -- and only the
-    # rare IsCancellationRequested read is gated by the interval.
-    #
-    # 0xFFFF (65,536) was wrong: that number is the CHECK's own cost over
-    # 65,536 iterations (65,536 x 1.56us =~ 0.1s), mislabelled here as the
-    # cost of the WORK between checkpoints. At the real work rate, 65,536
-    # iterations is ~35s between checkpoints -- confirmed at 26.17s on real
-    # sessions -- which leaves Cancel looking dead for half a minute against
-    # the "reacts within seconds" requirement this task exists for. 0x7FF
-    # (2,048) brings that to ~1.1s while leaving the per-iteration tax
-    # exactly where it was.
-    $cancelTick = 0
-    foreach ($s in $Sessions) {
-        if ((++$cancelTick -band 0x7FF) -eq 0 -and $script:ReportCancellationSource -and
-            $script:ReportCancellationSource.IsCancellationRequested) {
-            throw (New-Object System.OperationCanceledException 'The run was canceled.')
-        }
-        $i = Get-ClampedSessionIntervalCore $s $WindowStartUtc $WindowEndUtc $NowUtc
-        if (-not $i) { continue }
-        [void] $keys.Add(($i.EndUtc.Ticks   * 2))
-        [void] $keys.Add(($i.StartUtc.Ticks * 2) + 1)
-    }
-
-    if ($keys.Count -eq 0) {
-        return [pscustomobject]@{ Peak = 0; PeakAtUtc = $null }
-    }
-
-    $sorted = $keys.ToArray()
-    [Array]::Sort($sorted)
-
-    $current = 0; $peak = 0; $peakTicks = [long] 0
-    foreach ($key in $sorted) {
-        # -band / -shr rather than % and /: PowerShell's division returns a
-        # double, which silently loses precision above 2^53 -- and a tick
-        # count is far above it.
-        if ($key -band 1) { $current++ } else { $current-- }
-        if ($current -gt $peak) { $peak = $current; $peakTicks = $key -shr 1 }
-    }
-
-    $peakAt = $null
-    if ($peak -gt 0) {
-        $peakAt = [datetime]::new($peakTicks, [System.DateTimeKind]::Utc)
-    }
-
-    [pscustomobject]@{ Peak = $peak; PeakAtUtc = $peakAt }
+    $view = New-WindowSessionView $Sessions $WindowStartUtc $WindowEndUtc $NowUtc
+    Get-TickPeak $view.Start $view.End
 }
 
 function Get-ConcurrencySeries {
@@ -4280,60 +4868,13 @@ function Get-ConcurrencySeries {
 
     Assert-ValidAnalyticsWindow -WindowStartUtc $WindowStartUtc -WindowEndUtc $WindowEndUtc
 
-    # Ceiling, not Floor: a window whose length doesn't divide evenly by the
-    # interval still has a real sample instant at the start of the trailing
-    # remainder (e.g. a 65-minute window at 60-minute resolution must sample
-    # both minute 0 and minute 60). Floor would drop that instant, and with
-    # it any session open only during the remainder, understating the p95
-    # that a license count gets sized against. When the window divides
-    # evenly, Ceiling and Floor agree, so no existing behavior changes.
-    $bucketCount = [int][math]::Ceiling(($WindowEndUtc - $WindowStartUtc).TotalMinutes / $IntervalMinutes)
-    if ($bucketCount -le 0) { return @() }
-
-    $counts = New-Object 'int[]' $bucketCount
-
-    # Cancellation is checked on a counter rather than every iteration: the
-    # counter increment and mask test below run every iteration regardless
-    # of the interval -- measured ~1.56us added per iteration, ~0.3% against
-    # the ~530us/session-iteration work rate (2,384s / 4.5M iterations,
-    # measured at 500k across the three default windows) -- and only the
-    # rare IsCancellationRequested read is gated by the interval.
-    #
-    # 0xFFFF (65,536) was wrong: that number is the CHECK's own cost over
-    # 65,536 iterations (65,536 x 1.56us =~ 0.1s), mislabelled here as the
-    # cost of the WORK between checkpoints. At the real work rate, 65,536
-    # iterations is ~35s between checkpoints -- confirmed at 26.17s on real
-    # sessions -- which leaves Cancel looking dead for half a minute against
-    # the "reacts within seconds" requirement this task exists for. 0x7FF
-    # (2,048) brings that to ~1.1s while leaving the per-iteration tax
-    # exactly where it was.
-    $cancelTick = 0
-    foreach ($s in $Sessions) {
-        if ((++$cancelTick -band 0x7FF) -eq 0 -and $script:ReportCancellationSource -and
-            $script:ReportCancellationSource.IsCancellationRequested) {
-            throw (New-Object System.OperationCanceledException 'The run was canceled.')
-        }
-        $i = Get-ClampedSessionIntervalCore $s $WindowStartUtc $WindowEndUtc $NowUtc
-        if (-not $i) { continue }
-
-        # The first bucket whose start instant falls at or after the session
-        # start, through the last bucket that starts before the session ends.
-        $from = [int][math]::Ceiling(($i.StartUtc - $WindowStartUtc).TotalMinutes / $IntervalMinutes)
-        $to   = [int][math]::Ceiling(($i.EndUtc   - $WindowStartUtc).TotalMinutes / $IntervalMinutes) - 1
-
-        if ($from -lt 0) { $from = 0 }
-        if ($to -ge $bucketCount) { $to = $bucketCount - 1 }
-
-        for ($b = $from; $b -le $to; $b++) { $counts[$b]++ }
-    }
-
-    $series = New-Object System.Collections.Generic.List[object]
-    for ($b = 0; $b -lt $bucketCount; $b++) {
-        $series.Add([pscustomobject]@{
-            TimeUtc = $WindowStartUtc.AddMinutes($b * $IntervalMinutes)
-            Count   = $counts[$b]
-        })
-    }
+    # Ceiling, not Floor, for the bucket count: a window whose length doesn't
+    # divide evenly by the interval still has a real sample instant at the
+    # start of the trailing remainder (e.g. a 65-minute window at 60-minute
+    # resolution must sample both minute 0 and minute 60). Floor would drop
+    # that instant, and with it any session open only during the remainder,
+    # understating the p95 that a license count gets sized against.
+    $view = New-WindowSessionView $Sessions $WindowStartUtc $WindowEndUtc $NowUtc
 
     # Plain return, not a unary-comma-wrapped one: `@(Get-ConcurrencySeries
     # ...)` at the call site is the codebase's standard way to get a
@@ -4341,7 +4882,7 @@ function Get-ConcurrencySeries {
     # return works for a *bare* call but nests when the caller applies that
     # same @() -- silently turning "8,640 buckets" into "1", which is far
     # worse than the scalar collapse it was meant to prevent.
-    return $series.ToArray()
+    return (Get-ViewSeries $view $IntervalMinutes)
 }
 
 function Resolve-ReportTimeZone {
@@ -4432,7 +4973,10 @@ function Get-Percentile {
         [Parameter(Mandatory)][ValidateRange(0, 100)][double] $Percentile
     )
 
-    $sorted = @($Values | Sort-Object)
+    # [Array]::Sort over doubles rather than Sort-Object: the same order for
+    # numbers, without a pipeline per value.
+    $sorted = [double[]] @($Values)
+    [Array]::Sort($sorted)
     if ($sorted.Count -eq 0) { return 0 }
     if ($sorted.Count -eq 1) { return [double] $sorted[0] }
 
@@ -4468,66 +5012,8 @@ function Get-UniqueUserStats {
     # matching Get-PeakConcurrency / Get-ConcurrencySeries.
     Assert-ValidAnalyticsWindow -WindowStartUtc $WindowStartUtc -WindowEndUtc $WindowEndUtc
 
-    # Relies on the default ordinal-ignore-case comparer of a PowerShell
-    # hashtable literal: Citrix usernames are case-insensitive in practice
-    # (DOMAIN\alice, DOMAIN\Alice, and DOMAIN\ALICE are the same licensed
-    # person), so folding case here is required, not incidental. If this is
-    # ever swapped for a case-sensitive collection (e.g.
-    # Dictionary[string,bool]), the same person starts counting as multiple
-    # licensed users -- see the dedicated pinning test in
-    # tests/Analytics.Users.Tests.ps1.
-    $userIds = @{}
-    $anonymous = 0
-    $unattributed = 0
-    $total = 0
-
-    # Cancellation is checked on a counter rather than every iteration: the
-    # counter increment and mask test below run every iteration regardless
-    # of the interval -- measured ~1.56us added per iteration, ~0.3% against
-    # the ~530us/session-iteration work rate (2,384s / 4.5M iterations,
-    # measured at 500k across the three default windows) -- and only the
-    # rare IsCancellationRequested read is gated by the interval.
-    #
-    # 0xFFFF (65,536) was wrong: that number is the CHECK's own cost over
-    # 65,536 iterations (65,536 x 1.56us =~ 0.1s), mislabelled here as the
-    # cost of the WORK between checkpoints. At the real work rate, 65,536
-    # iterations is ~35s between checkpoints -- confirmed at 26.17s on real
-    # sessions -- which leaves Cancel looking dead for half a minute against
-    # the "reacts within seconds" requirement this task exists for. 0x7FF
-    # (2,048) brings that to ~1.1s while leaving the per-iteration tax
-    # exactly where it was.
-    $cancelTick = 0
-    foreach ($s in $Sessions) {
-        if ((++$cancelTick -band 0x7FF) -eq 0 -and $script:ReportCancellationSource -and
-            $script:ReportCancellationSource.IsCancellationRequested) {
-            throw (New-Object System.OperationCanceledException 'The run was canceled.')
-        }
-        $i = Get-ClampedSessionIntervalCore $s $WindowStartUtc $WindowEndUtc $NowUtc
-        if (-not $i) { continue }
-
-        $total++
-
-        if ($s.IsAnonymous) { $anonymous++; continue }
-        # A blank/null UserId that is NOT flagged IsAnonymous still happens in
-        # real Citrix exports (de-provisioned accounts, broker glitches). It
-        # must not be counted as a named user, but it must not vanish without
-        # a trace either: every in-window session lands in exactly one of the
-        # three buckets below, so attributed sessions + AnonymousSessions +
-        # UnattributedSessions == TotalSessions. UniqueUsers is NOT a term in
-        # that sum -- it counts distinct people, not sessions, and one person
-        # routinely has many sessions in a window.
-        if ([string]::IsNullOrWhiteSpace($s.UserId)) { $unattributed++; continue }
-
-        $userIds[$s.UserId] = $true
-    }
-
-    [pscustomobject]@{
-        UniqueUsers          = $userIds.Count
-        UniqueUserIds        = @($userIds.Keys)
-        AnonymousSessions    = $anonymous
-        UnattributedSessions = $unattributed
-        TotalSessions        = $total
-    }
+    $view = New-WindowSessionView $Sessions $WindowStartUtc $WindowEndUtc $NowUtc
+    Get-ViewUniqueUsers $view
 }
 
 function Get-DailyTrend {
@@ -4559,6 +5045,16 @@ function Get-DailyTrend {
     # per-session processing happens.
     Assert-ValidAnalyticsWindow -WindowStartUtc $WindowStartUtc -WindowEndUtc $WindowEndUtc
 
+    $view = New-WindowSessionView $Sessions $WindowStartUtc $WindowEndUtc $NowUtc
+
+    # Plain return, not a unary-comma-wrapped one -- see the .DESCRIPTION note
+    # above and Get-ConcurrencySeries for why.
+    return (Get-ViewDailyTrend $view)
+}
+
+function Get-ViewDailyTrend($View) {
+    # Get-DailyTrend on a view.
+    $WindowStartUtc = $View.WindowStartUtc
     $firstDay = $WindowStartUtc.Date
 
     # dayCount is measured from the bucket anchor (midnight on the window's
@@ -4570,42 +5066,22 @@ function Get-DailyTrend {
     # can now cover a partial day (only the part of it inside the window),
     # which is correct: the window starts mid-day, so that row legitimately
     # represents less than 24 hours.
-    $dayCount = [int][math]::Ceiling(($WindowEndUtc - $firstDay).TotalDays)
+    $dayCount = [int][math]::Ceiling(($View.WindowEndUtc - $firstDay).TotalDays)
     if ($dayCount -le 0) { return @() }
 
-    # Bucket sessions by the days they touch first, so each day's analytics run
-    # over a small slice instead of the whole set. On a 90-day window with
-    # hundreds of thousands of sessions, re-scanning everything per day would
-    # turn a fast report into a multi-minute one.
-    $byDay = @{}
-    for ($d = 0; $d -lt $dayCount; $d++) { $byDay[$d] = New-Object System.Collections.Generic.List[object] }
+    # Each session goes to every day its in-window interval touches, so each
+    # day's figures come from a small slice instead of the whole set.
+    $byDay = New-Object 'object[]' $dayCount
+    for ($d = 0; $d -lt $dayCount; $d++) { $byDay[$d] = New-Object System.Collections.Generic.List[int] }
 
-    # Cancellation is checked on a counter rather than every iteration: the
-    # counter increment and mask test below run every iteration regardless
-    # of the interval -- measured ~1.56us added per iteration, ~0.3% against
-    # the ~530us/session-iteration work rate (2,384s / 4.5M iterations,
-    # measured at 500k across the three default windows) -- and only the
-    # rare IsCancellationRequested read is gated by the interval.
-    #
-    # 0xFFFF (65,536) was wrong: that number is the CHECK's own cost over
-    # 65,536 iterations (65,536 x 1.56us =~ 0.1s), mislabelled here as the
-    # cost of the WORK between checkpoints. At the real work rate, 65,536
-    # iterations is ~35s between checkpoints -- confirmed at 26.17s on real
-    # sessions -- which leaves Cancel looking dead for half a minute against
-    # the "reacts within seconds" requirement this task exists for. 0x7FF
-    # (2,048) brings that to ~1.1s while leaving the per-iteration tax
-    # exactly where it was.
-    $cancelTick = 0
-    foreach ($s in $Sessions) {
-        if ((++$cancelTick -band 0x7FF) -eq 0 -and $script:ReportCancellationSource -and
-            $script:ReportCancellationSource.IsCancellationRequested) {
-            throw (New-Object System.OperationCanceledException 'The run was canceled.')
-        }
-        $i = Get-ClampedSessionIntervalCore $s $WindowStartUtc $WindowEndUtc $NowUtc
-        if (-not $i) { continue }
-
-        $from = [int][math]::Floor(($i.StartUtc.Date - $firstDay).TotalDays)
-        $to   = [int][math]::Floor(($i.EndUtc.Date   - $firstDay).TotalDays)
+    $firstTicks = $firstDay.Ticks
+    $dayTicks = [TimeSpan]::TicksPerDay
+    $n = $View.Start.Count
+    for ($i = 0; $i -lt $n; $i++) {
+        # Whole days from the first midnight, as (clamped.Date - firstDay)
+        # was: both are integers of ticks well inside a double's exact range.
+        $from = [int][math]::Floor([double]($View.Start[$i] - $firstTicks) / $dayTicks)
+        $to   = [int][math]::Floor([double]($View.End[$i]   - $firstTicks) / $dayTicks)
         if ($from -lt 0) { $from = 0 }
         if ($from -ge $dayCount) { $from = $dayCount - 1 }
         if ($to -lt 0) { $to = 0 }
@@ -4615,21 +5091,34 @@ function Get-DailyTrend {
         # mismatched pair; skip rather than let the loop below run backwards
         # or fault, so a future range error degrades to "not counted here".
         if ($from -le $to) {
-            for ($d = $from; $d -le $to; $d++) { [void] $byDay[$d].Add($s) }
+            for ($d = $from; $d -le $to; $d++) { $byDay[$d].Add($i) }
         }
     }
 
     $results = New-Object System.Collections.Generic.List[object]
-
     for ($d = 0; $d -lt $dayCount; $d++) {
         $dayStart = [datetime]::SpecifyKind($firstDay.AddDays($d), [System.DateTimeKind]::Utc)
         $dayEnd = $dayStart.AddDays(1)
-        $slice = $byDay[$d]
+        $ds = $dayStart.Ticks
+        $de = $dayEnd.Ticks
 
-        $users = Get-UniqueUserStats -Sessions $slice -WindowStartUtc $dayStart `
-            -WindowEndUtc $dayEnd -NowUtc $NowUtc
-        $peak = Get-PeakConcurrency -Sessions $slice -WindowStartUtc $dayStart `
-            -WindowEndUtc $dayEnd -NowUtc $NowUtc
+        # Each day is its own window, cut from the session's own interval --
+        # not from its interval in the outer window -- exactly as clamping
+        # the session to the day would.
+        $kept = New-Object System.Collections.Generic.List[object]
+        $cs = New-Object System.Collections.Generic.List[long]
+        $ce = New-Object System.Collections.Generic.List[long]
+        foreach ($i in $byDay[$d]) {
+            $a = $View.RawStart[$i]
+            if ($a -lt $ds) { $a = $ds }
+            $b = $View.RawEnd[$i]
+            if ($b -gt $de) { $b = $de }
+            if ($b -le $a) { continue }
+            $kept.Add($View.Sessions[$i]); $cs.Add($a); $ce.Add($b)
+        }
+        $day = [pscustomobject]@{ Sessions = $kept.ToArray() }
+        $users = Get-ViewUniqueUsers $day
+        $peak = Get-TickPeak $cs.ToArray() $ce.ToArray()
 
         $results.Add([pscustomobject]@{
             DateUtc        = $dayStart
@@ -4639,8 +5128,6 @@ function Get-DailyTrend {
         })
     }
 
-    # Plain return, not a unary-comma-wrapped one -- see the .DESCRIPTION note
-    # above and Get-ConcurrencySeries for why.
     return $results.ToArray()
 }
 
@@ -4685,48 +5172,36 @@ function Get-DeliveryGroupBreakdown {
     $haveGroups = @($Dataset.DesktopGroups).Count -gt 0
     if (-not $haveMachines -and -not $haveGroups) { return @() }
 
+    $view = New-WindowSessionView $Dataset.Sessions $WindowStartUtc $WindowEndUtc $NowUtc
+    Get-ViewDeliveryGroups $Dataset $view
+}
+
+function Get-ViewDeliveryGroups($Dataset, $View) {
+    # Get-DeliveryGroupBreakdown on a view, for the same window.
     $machineToGroup = @{}
     foreach ($m in $Dataset.Machines) { $machineToGroup[[string]$m.Id] = [string]$m.DesktopGroupId }
 
     $groupNames = @{}
     foreach ($g in $Dataset.DesktopGroups) { $groupNames[[string]$g.Id] = [string]$g.Name }
 
+    # A group whose sessions all fall outside the window has none in the
+    # view, so it is left out, as a group with no sessions in it always was.
     $byGroup = @{}
-
-    # Cancellation is checked on a counter rather than every iteration: the
-    # counter increment and mask test below run every iteration regardless
-    # of the interval -- measured ~1.56us added per iteration, ~0.3% against
-    # the ~530us/session-iteration work rate (2,384s / 4.5M iterations,
-    # measured at 500k across the three default windows) -- and only the
-    # rare IsCancellationRequested read is gated by the interval.
-    #
-    # This bucketing pass is otherwise invisible to Cancel: it runs before
-    # the per-group Get-UniqueUserStats / Get-PeakConcurrency calls below,
-    # each of which resets its OWN $cancelTick over just its group's slice --
-    # so unless a single delivery group holds more sessions than the check
-    # interval, none of those nested checks ever fire, and without this one
-    # a whole sweep of every session in the window has no checkpoint at all.
-    $cancelTick = 0
-    foreach ($s in $Dataset.Sessions) {
-        if ((++$cancelTick -band 0x7FF) -eq 0 -and $script:ReportCancellationSource -and
-            $script:ReportCancellationSource.IsCancellationRequested) {
-            throw (New-Object System.OperationCanceledException 'The run was canceled.')
-        }
-        $gid = $machineToGroup[[string]$s.MachineId]
-        $name = if ($gid -and $groupNames.ContainsKey($gid)) { $groupNames[$gid] } else { 'Unknown (machine no longer present)' }
+    $n = $View.Sessions.Count
+    for ($i = 0; $i -lt $n; $i++) {
+        $gid = $machineToGroup[[string]$View.Sessions[$i].MachineId]
+        $name = 'Unknown (machine no longer present)'
+        if ($gid -and $groupNames.ContainsKey($gid)) { $name = $groupNames[$gid] }
         if (-not $byGroup.ContainsKey($name)) {
-            $byGroup[$name] = New-Object System.Collections.Generic.List[object]
+            $byGroup[$name] = New-Object System.Collections.Generic.List[int]
         }
-        [void] $byGroup[$name].Add($s)
+        $byGroup[$name].Add($i)
     }
 
     $results = foreach ($name in $byGroup.Keys) {
-        $slice = $byGroup[$name]
-        $users = Get-UniqueUserStats -Sessions $slice -WindowStartUtc $WindowStartUtc `
-            -WindowEndUtc $WindowEndUtc -NowUtc $NowUtc
-        if ($users.TotalSessions -eq 0) { continue }
-        $peak = Get-PeakConcurrency -Sessions $slice -WindowStartUtc $WindowStartUtc `
-            -WindowEndUtc $WindowEndUtc -NowUtc $NowUtc
+        $slice = Select-WindowSessionView $View $byGroup[$name]
+        $users = Get-ViewUniqueUsers $slice
+        $peak = Get-TickPeak $slice.Start $slice.End
 
         [pscustomobject]@{
             Name           = $name
@@ -4755,18 +5230,24 @@ function Get-SessionTypeBreakdown {
         [Parameter(Mandatory)][datetime] $NowUtc
     )
 
-    # A single check here, not one instrumented inside either pipeline: two
-    # Where-Object passes over the same session set are cheap relative to the
-    # six Get-ClampedSessionIntervalCore loops, and splicing a counter check
-    # into a pipeline scriptblock (rather than a plain foreach body) is not
-    # the shape this codebase's cancellation checks use elsewhere.
-    Assert-NotCancelled
+    Assert-ValidAnalyticsWindow -WindowStartUtc $WindowStartUtc -WindowEndUtc $WindowEndUtc
+    $view = New-WindowSessionView $Sessions $WindowStartUtc $WindowEndUtc $NowUtc
+    Get-ViewSessionTypes $view
+}
 
-    $desktop = @($Sessions | Where-Object { $_.SessionType -eq 0 })
-    $app     = @($Sessions | Where-Object { $_.SessionType -eq 1 })
+function Get-ViewSessionTypes($View) {
+    # Get-SessionTypeBreakdown on a view. One pass sorts the sessions by
+    # type; the two Where-Object passes this replaced were the slowest part.
+    $desktop = New-Object System.Collections.Generic.List[int]
+    $app = New-Object System.Collections.Generic.List[int]
+    $n = $View.Sessions.Count
+    for ($i = 0; $i -lt $n; $i++) {
+        $type = $View.Sessions[$i].SessionType
+        if ($type -eq 0) { $desktop.Add($i) } elseif ($type -eq 1) { $app.Add($i) }
+    }
 
-    $d = Get-UniqueUserStats -Sessions $desktop -WindowStartUtc $WindowStartUtc -WindowEndUtc $WindowEndUtc -NowUtc $NowUtc
-    $a = Get-UniqueUserStats -Sessions $app     -WindowStartUtc $WindowStartUtc -WindowEndUtc $WindowEndUtc -NowUtc $NowUtc
+    $d = Get-ViewUniqueUsers (Select-WindowSessionView $View $desktop)
+    $a = Get-ViewUniqueUsers (Select-WindowSessionView $View $app)
 
     [pscustomobject]@{
         DesktopUsers        = $d.UniqueUsers
@@ -4797,42 +5278,25 @@ function Get-ApplicationBreakdown {
 
     if (-not $Dataset.ApplicationInstances -or $Dataset.ApplicationInstances.Count -eq 0) { return @() }
 
-    # Only sessions inside the window contribute, so build the eligible set once.
-    # IsAnonymous is carried alongside UserId (not folded into a bare UserId
-    # map) so that Launches can still count every in-window launch -- an
-    # anonymous session is a real launch -- while UniqueUsers, like every
-    # other unique-user count in this file, excludes anonymous sessions from
-    # the named-user tally even when IsAnonymous is (unusually) paired with a
-    # non-blank UserId.
-    $sessionInfo = @{}
+    $view = New-WindowSessionView $Dataset.Sessions $WindowStartUtc $WindowEndUtc $NowUtc
+    Get-ViewApplications $Dataset $view $Top
+}
 
-    # Cancellation is checked on a counter rather than every iteration: the
-    # counter increment and mask test below run every iteration regardless
-    # of the interval -- measured ~1.56us added per iteration, ~0.3% against
-    # the ~530us/session-iteration work rate (2,384s / 4.5M iterations,
-    # measured at 500k across the three default windows) -- and only the
-    # rare IsCancellationRequested read is gated by the interval.
-    #
-    # 0xFFFF (65,536) was wrong: that number is the CHECK's own cost over
-    # 65,536 iterations (65,536 x 1.56us =~ 0.1s), mislabelled here as the
-    # cost of the WORK between checkpoints. At the real work rate, 65,536
-    # iterations is ~35s between checkpoints -- confirmed at 26.17s on real
-    # sessions -- which leaves Cancel looking dead for half a minute against
-    # the "reacts within seconds" requirement this task exists for. 0x7FF
-    # (2,048) brings that to ~1.1s while leaving the per-iteration tax
-    # exactly where it was.
-    $cancelTick = 0
-    foreach ($s in $Dataset.Sessions) {
-        if ((++$cancelTick -band 0x7FF) -eq 0 -and $script:ReportCancellationSource -and
-            $script:ReportCancellationSource.IsCancellationRequested) {
-            throw (New-Object System.OperationCanceledException 'The run was canceled.')
-        }
-        $i = Get-ClampedSessionIntervalCore $s $WindowStartUtc $WindowEndUtc $NowUtc
-        if ($i) {
-            $sessionInfo[[string]$s.SessionKey] = [pscustomobject]@{
-                UserId      = [string]$s.UserId
-                IsAnonymous = [bool]$s.IsAnonymous
-            }
+function Get-ViewApplications($Dataset, $View, [int] $Top) {
+    # Get-ApplicationBreakdown on a view.
+    if (-not $Dataset.ApplicationInstances -or $Dataset.ApplicationInstances.Count -eq 0) { return @() }
+
+    # Only sessions inside the window contribute. IsAnonymous is carried
+    # alongside UserId (not folded into a bare UserId map) so that Launches
+    # can still count every in-window launch -- an anonymous session is a
+    # real launch -- while UniqueUsers, like every other unique-user count in
+    # this file, excludes anonymous sessions from the named-user tally even
+    # when IsAnonymous is (unusually) paired with a non-blank UserId.
+    $sessionInfo = @{}
+    foreach ($s in $View.Sessions) {
+        $sessionInfo[[string]$s.SessionKey] = [pscustomobject]@{
+            UserId      = [string]$s.UserId
+            IsAnonymous = [bool]$s.IsAnonymous
         }
     }
 
@@ -4895,32 +5359,18 @@ function Get-ClientDeviceBreakdown {
         return [pscustomobject]@{ UniqueDevices = 0; UniqueAddresses = 0; VersionCounts = @() }
     }
 
-    $eligible = @{}
+    $view = New-WindowSessionView $Dataset.Sessions $WindowStartUtc $WindowEndUtc $NowUtc
+    Get-ViewClientDevices $Dataset $view
+}
 
-    # Cancellation is checked on a counter rather than every iteration: the
-    # counter increment and mask test below run every iteration regardless
-    # of the interval -- measured ~1.56us added per iteration, ~0.3% against
-    # the ~530us/session-iteration work rate (2,384s / 4.5M iterations,
-    # measured at 500k across the three default windows) -- and only the
-    # rare IsCancellationRequested read is gated by the interval.
-    #
-    # 0xFFFF (65,536) was wrong: that number is the CHECK's own cost over
-    # 65,536 iterations (65,536 x 1.56us =~ 0.1s), mislabelled here as the
-    # cost of the WORK between checkpoints. At the real work rate, 65,536
-    # iterations is ~35s between checkpoints -- confirmed at 26.17s on real
-    # sessions -- which leaves Cancel looking dead for half a minute against
-    # the "reacts within seconds" requirement this task exists for. 0x7FF
-    # (2,048) brings that to ~1.1s while leaving the per-iteration tax
-    # exactly where it was.
-    $cancelTick = 0
-    foreach ($s in $Dataset.Sessions) {
-        if ((++$cancelTick -band 0x7FF) -eq 0 -and $script:ReportCancellationSource -and
-            $script:ReportCancellationSource.IsCancellationRequested) {
-            throw (New-Object System.OperationCanceledException 'The run was canceled.')
-        }
-        $i = Get-ClampedSessionIntervalCore $s $WindowStartUtc $WindowEndUtc $NowUtc
-        if ($i) { $eligible[[string]$s.SessionKey] = $true }
+function Get-ViewClientDevices($Dataset, $View) {
+    # Get-ClientDeviceBreakdown on a view.
+    if (-not $Dataset.Connections -or $Dataset.Connections.Count -eq 0) {
+        return [pscustomobject]@{ UniqueDevices = 0; UniqueAddresses = 0; VersionCounts = @() }
     }
+
+    $eligible = @{}
+    foreach ($s in $View.Sessions) { $eligible[[string]$s.SessionKey] = $true }
 
     $devices = @{}; $addresses = @{}; $versions = @{}
     foreach ($c in $Dataset.Connections) {
@@ -5078,16 +5528,17 @@ function Invoke-ReportAnalysis {
             }
         }.GetNewClosure()
 
+        # The window's sessions, clamped once. Every figure below reads this
+        # rather than going back over every session: see New-WindowSessionView.
+        Assert-ValidAnalyticsWindow -WindowStartUtc $effectiveStart -WindowEndUtc $now
         & $report 'unique users' 0
-        $users = Get-UniqueUserStats -Sessions $Dataset.Sessions -WindowStartUtc $effectiveStart `
-            -WindowEndUtc $now -NowUtc $now
+        $view = New-WindowSessionView $Dataset.Sessions $effectiveStart $now $now
+        $users = Get-ViewUniqueUsers $view
 
         & $report 'concurrency peak' 1
-        $peak = Get-PeakConcurrency -Sessions $Dataset.Sessions -WindowStartUtc $effectiveStart `
-            -WindowEndUtc $now -NowUtc $now
+        $peak = Get-TickPeak $view.Start $view.End
         & $report 'concurrency over time' 2
-        $series = @(Get-ConcurrencySeries -Sessions $Dataset.Sessions -WindowStartUtc $effectiveStart `
-            -WindowEndUtc $now -NowUtc $now -IntervalMinutes 15)
+        $series = @(Get-ViewSeries $view 15)
         $windowOrdinal++
 
         $counts = @($series | ForEach-Object { $_.Count })
@@ -5155,13 +5606,16 @@ function Invoke-ReportAnalysis {
         $deliveryGroups = $null
         if ($Config.IncludeDeliveryGroups) {
             Assert-NotCancelled
-            $deliveryGroups = @(Get-DeliveryGroupBreakdown -Dataset $Dataset -WindowStartUtc $effectiveStart -WindowEndUtc $now -NowUtc $now)
+            $deliveryGroups = @()
+            if (@($Dataset.Machines).Count -gt 0 -or @($Dataset.DesktopGroups).Count -gt 0) {
+                $deliveryGroups = @(Get-ViewDeliveryGroups $Dataset $view)
+            }
         }
 
         $applications = $null
         if ($Config.IncludeApplications) {
             Assert-NotCancelled
-            $applications = @(Get-ApplicationBreakdown -Dataset $Dataset -WindowStartUtc $effectiveStart -WindowEndUtc $now -NowUtc $now)
+            $applications = @(Get-ViewApplications $Dataset $view 20)
         }
 
         # Get-DailyTrend also returns a plain array and is exposed to the same
@@ -5173,7 +5627,7 @@ function Invoke-ReportAnalysis {
         $dailyTrend = $null
         if ($Config.IncludeTrend) {
             Assert-NotCancelled
-            $dailyTrend = @(Get-DailyTrend -Sessions $Dataset.Sessions -WindowStartUtc $effectiveStart -WindowEndUtc $now -NowUtc $now)
+            $dailyTrend = @(Get-ViewDailyTrend $view)
         }
 
         [pscustomobject]@{
@@ -5199,12 +5653,12 @@ function Invoke-ReportAnalysis {
             # subexpression returns.
             SessionTypes       = $(if ($Config.IncludeApplications) {
                 Assert-NotCancelled
-                Get-SessionTypeBreakdown -Sessions $Dataset.Sessions -WindowStartUtc $effectiveStart -WindowEndUtc $now -NowUtc $now
+                Get-ViewSessionTypes $view
             } else { $null })
             Applications       = $applications
             ClientDevices      = $(if ($Config.IncludeClientDevices) {
                 Assert-NotCancelled
-                Get-ClientDeviceBreakdown -Dataset $Dataset -WindowStartUtc $effectiveStart -WindowEndUtc $now -NowUtc $now
+                Get-ViewClientDevices $Dataset $view
             } else { $null })
             DailyTrend         = $dailyTrend
         }
@@ -6455,6 +6909,15 @@ function New-WindowSection {
     $bizLabel = '{0:00}:00&ndash;{1:00}:00 Mon&ndash;Fri, {2}' -f $bizStart, $bizEnd,
         (ConvertTo-HtmlEncoded -Text $bizZone)
 
+    # Every figure in the row below comes from Sessions, so a Sessions fetch
+    # that stopped short makes all four a lower bound. Said on each figure,
+    # not only in a banner: the peak is the number people copy out of a
+    # report, and it is copied without the banner above it.
+    $lowerBound = ''
+    if (Test-SessionFetchIncomplete -Warnings $FetchWarnings) {
+        $lowerBound = "`n      <div class=""note""><strong>Lower bound</strong>: session data incomplete</div>"
+    }
+
     $sections = New-Object System.Collections.Generic.List[string]
 
     [void] $sections.Add(@"
@@ -6466,27 +6929,28 @@ function New-WindowSection {
   </p>
   $(New-TruncationNotice -Window $Window)
   $(New-PartialCoverageNotice -Window $Window)
+  $(New-FetchWarningNotice -Warnings $FetchWarnings -Entities @('Sessions'))
 
   <div class="kpi-row">
     <div class="kpi">
       <div class="label">Unique users</div>
       <div class="value">$($Window.UniqueUsers)</div>
-      <div class="note">Distinct users with at least one session</div>
+      <div class="note">Distinct users with at least one session</div>$lowerBound
     </div>
     <div class="kpi">
       <div class="label">Peak concurrent sessions</div>
       <div class="value">$($c.Peak)</div>
-      <div class="note">$(Format-LocalTime -Utc $c.PeakAtUtc -TimeZoneId $TimeZoneId)</div>
+      <div class="note">$(Format-LocalTime -Utc $c.PeakAtUtc -TimeZoneId $TimeZoneId)</div>$lowerBound
     </div>
     <div class="kpi">
       <div class="label">95th percentile concurrent sessions</div>
       <div class="value">$([math]::Round($c.P95, 0))</div>
-      <div class="note">Business hours ($bizLabel): $([math]::Round($c.BusinessP95, 0))</div>
+      <div class="note">Business hours ($bizLabel): $([math]::Round($c.BusinessP95, 0))</div>$lowerBound
     </div>
     <div class="kpi">
       <div class="label">Total sessions</div>
       <div class="value">$($Window.TotalSessions)</div>
-      <div class="note">$($Window.AnonymousSessions) anonymous, $($Window.UnattributedSessions) unattributed</div>
+      <div class="note">$($Window.AnonymousSessions) anonymous, $($Window.UnattributedSessions) unattributed</div>$lowerBound
     </div>
   </div>
 
@@ -7492,6 +7956,50 @@ function ConvertTo-ReportRoundTripUtcText {
     return $Value.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
+function Write-SessionsCsv {
+    <#
+    .SYNOPSIS
+        Writes sessions.csv exactly as Export-Csv did, one line at a time.
+    .DESCRIPTION
+        Export-Csv took an object per session and most of the 1.7 minutes
+        the export step spent on 489,000 sessions. This writes the same bytes:
+        UTF-8 with a byte order mark (Excel uses it), every field quoted with
+        inner quotes doubled, CRLF line ends, and the timestamps in
+        ConvertTo-ReportRoundTripUtcText's invariant form. A test compares
+        the two outputs byte for byte.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()] $Sessions,
+        [Parameter(Mandatory)][string] $Path
+    )
+
+    $fmt = 'yyyy-MM-ddTHH:mm:ssZ'
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $writer = New-Object System.IO.StreamWriter($Path, $false, (New-Object System.Text.UTF8Encoding($true)))
+    try {
+        $writer.WriteLine('"SessionKey","UserId","MachineId","StartUtc","EndUtc","SessionType","IsAnonymous"')
+        foreach ($s in $Sessions) {
+            # Export-Csv writes a null field as nothing at all, not as "".
+            $key = ''; $user = ''; $machine = ''; $type = ''; $anon = ''
+            if ($null -ne $s.SessionKey)  { $key = '"' + ([string] $s.SessionKey).Replace('"', '""') + '"' }
+            if ($null -ne $s.UserId)      { $user = '"' + ([string] $s.UserId).Replace('"', '""') + '"' }
+            if ($null -ne $s.MachineId)   { $machine = '"' + ([string] $s.MachineId).Replace('"', '""') + '"' }
+            if ($null -ne $s.SessionType) { $type = '"' + ([string] $s.SessionType).Replace('"', '""') + '"' }
+            if ($null -ne $s.IsAnonymous) { $anon = '"' + ([string] $s.IsAnonymous) + '"' }
+            # The timestamps are always text, "" when there is none, as
+            # ConvertTo-ReportRoundTripUtcText gave Export-Csv.
+            $start = ''
+            if ($null -ne $s.StartUtc) { $start = $s.StartUtc.ToString($fmt, $inv) }
+            $end = ''
+            if ($null -ne $s.EndUtc) { $end = $s.EndUtc.ToString($fmt, $inv) }
+            $writer.WriteLine($key + ',' + $user + ',' + $machine + ',"' + $start + '","' + $end + '",' + $type + ',' + $anon)
+        }
+    } finally {
+        $writer.Dispose()
+    }
+}
+
 function Export-ReportData {
     <#
     .SYNOPSIS
@@ -7631,6 +8139,10 @@ function Export-ReportData {
     # no file at all.
     if ($windows.Count -gt 0) {
         $summaryPath = Join-Path $OutputPath 'summary.csv'
+        # Every figure in a row comes from Sessions, so this marks the whole
+        # row as a lower bound. Last, so a reader that finds columns by
+        # position still finds the existing ones where they were.
+        $sessionsIncomplete = Test-SessionFetchIncomplete -Warnings $fetchWarnings
         @($windows | ForEach-Object {
             [pscustomobject]@{
                 WindowDays              = $_.Days
@@ -7645,6 +8157,7 @@ function Export-ReportData {
                 BusinessHoursDefinition  = '{0:00}:00-{1:00}:00 Mon-Fri {2}' -f `
                     [int] $_.Concurrency.BusinessHourStart, [int] $_.Concurrency.BusinessHourEnd,
                     $_.Concurrency.BusinessTimeZoneId
+                SessionsIncomplete      = $sessionsIncomplete
             }
         }) | Export-Csv -Path $summaryPath -NoTypeInformation -Encoding UTF8
         [void] $written.Add($summaryPath)
@@ -7653,7 +8166,18 @@ function Export-ReportData {
     $widest = $windows | Sort-Object Days -Descending | Select-Object -First 1
     if ($widest -and $widest.DailyTrend) {
         $trendPath = Join-Path $OutputPath 'daily-trend.csv'
-        $widest.DailyTrend | Export-Csv -Path $trendPath -NoTypeInformation -Encoding UTF8
+        # The date as text, yyyy-MM-dd: a [datetime] here is written in the
+        # machine's own format, "10/4/2026 12:00:00 AM" on an English one,
+        # which a reader elsewhere takes as 10 April. Each row is a whole
+        # UTC day, so the time of day carries nothing.
+        @($widest.DailyTrend | ForEach-Object {
+            [pscustomobject]@{
+                DateUtc        = ([datetime] $_.DateUtc).ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
+                UniqueUsers    = $_.UniqueUsers
+                PeakConcurrent = $_.PeakConcurrent
+                TotalSessions  = $_.TotalSessions
+            }
+        }) | Export-Csv -Path $trendPath -NoTypeInformation -Encoding UTF8
         [void] $written.Add($trendPath)
     }
 
@@ -7665,19 +8189,8 @@ function Export-ReportData {
     # format, so a customer in another locale gets back a file they can
     # actually parse.
     if ($sessions.Count -gt 0) {
-        $sessionsPath = Join-Path $OutputPath 'sessions.csv'
-        $sessionRows = foreach ($s in $sessions) {
-            [pscustomobject]@{
-                SessionKey  = $s.SessionKey
-                UserId      = $s.UserId
-                MachineId   = $s.MachineId
-                StartUtc    = ConvertTo-ReportRoundTripUtcText -Value $s.StartUtc
-                EndUtc      = ConvertTo-ReportRoundTripUtcText -Value $s.EndUtc
-                SessionType = $s.SessionType
-                IsAnonymous = $s.IsAnonymous
-            }
-        }
-        @($sessionRows) | Export-Csv -Path $sessionsPath -NoTypeInformation -Encoding UTF8
+        $sessionsPath = Join-Path $jsonDir 'sessions.csv'
+        Write-SessionsCsv -Sessions $sessions -Path $sessionsPath
         [void] $written.Add($sessionsPath)
     }
 
@@ -7960,7 +8473,21 @@ function Export-MergeData {
         sessions = [object[]] $sessions.ToArray()
     }
 
-    $json = $payload | ConvertTo-Json -Depth 8
+    # Said in the export itself, or a site whose sessions were not all read
+    # would be consolidated into totals that carry no warning at all. Added
+    # only when true, so a complete export is byte-identical to one from
+    # before this existed, and older readers ignore it.
+    $fetchWarnings = @()
+    if ($Dataset.PSObject.Properties['FetchWarnings']) { $fetchWarnings = @($Dataset.FetchWarnings) }
+    if (Test-SessionFetchIncomplete -Warnings $fetchWarnings) {
+        $payload['sessionsIncomplete'] = $true
+    }
+
+    # -Compress: indented, Windows PowerShell 5.1 writes about 385
+    # characters a session, so a 90-day export from a site with a few
+    # million sessions approaches the largest string .NET can hold. Compact
+    # it is half that, and about four times faster to write.
+    $json = $payload | ConvertTo-Json -Depth 8 -Compress
 
     # No BOM: RFC 8259 forbids it and Python and JavaScript parsers reject it.
     # The same defect was found and fixed once already in data.json, so it is
@@ -8732,6 +9259,23 @@ function New-ConsolidatedDataset {
     $fullCoverageStart = $(if ($covStarts.Count -gt 0) { ($covStarts | Measure-Object -Maximum).Maximum } else { $earliest })
     $unconfirmed = @($coverage | Where-Object { -not $_.HistoryConfirmed }).Count
 
+    # A site whose own fetch stopped short makes every combined total a
+    # lower bound too. Raised as a Sessions fetch warning so the combined
+    # report, its files and Find a user treat it exactly as they treat a
+    # single site's.
+    $fetchWarnings = @($imports | Where-Object {
+        $_.Export.PSObject.Properties['sessionsIncomplete'] -and $_.Export.sessionsIncomplete
+    } | ForEach-Object {
+        $label = [string] $_.Export.site.environmentLabel
+        if ([string]::IsNullOrWhiteSpace($label)) { $label = 'one site' }
+        [pscustomobject]@{
+            Entity      = 'Sessions'
+            Reason      = 'SiteIncomplete'
+            RecordCount = @($_.Export.sessions).Count
+            Message     = "Not every session was read when the export from $label was made, so it holds an arbitrary subset of that site's sessions. Run that site's export again with this version."
+        }
+    })
+
     [pscustomobject]@{
         Sessions             = $sessions
         Users                = $users
@@ -8741,7 +9285,7 @@ function New-ConsolidatedDataset {
         Connections          = @()
         ApplicationInstances = @()
         Applications         = @()
-        FetchWarnings        = @()
+        FetchWarnings        = $fetchWarnings
         IsDemo               = $false
         SiteIdentity         = [pscustomobject]@{
             QueriedController    = "Consolidated from $($imports.Count) export(s)"
@@ -9004,6 +9548,7 @@ function New-ReportRunObject {
         HasMergeExport = $false
         Sessions       = $null
         CombinedIndex  = $null
+        SessionsIncomplete = $false
     }
 }
 
@@ -9168,6 +9713,15 @@ function Read-ReportRunFolder {
             })
             $run.WindowsSource = 'merge-export.json'
         }
+    }
+
+    # A run that did not read every session cannot say a person was absent
+    # from it: their sessions may be among those it never read.
+    if ($data -and $data.PSObject.Properties['FetchWarnings']) {
+        $run.SessionsIncomplete = Test-SessionFetchIncomplete -Warnings @($data.FetchWarnings)
+    }
+    if ($merge -and $merge.PSObject.Properties['sessionsIncomplete'] -and $merge.sessionsIncomplete) {
+        $run.SessionsIncomplete = $true
     }
     } catch {
         $run.Kind = 'Unreadable'
@@ -9447,6 +10001,10 @@ function Get-ReportUserVerdict {
             # No window table: every row would read "no" or "not sure", and
             # a "no" next to "cannot confirm" is a claim this cannot make.
             $result.Reason = 'Session times are saved to the second, and one of this account''s sessions ends too close to the edge of the report''s windows to be sure.'
+            return $result
+        }
+        if ($Run.PSObject.Properties['SessionsIncomplete'] -and $Run.SessionsIncomplete) {
+            $result.Reason = 'Not every session was read when this report was made, so this account''s sessions may be among those missing. Run the report again with version 1.14.4 or later to confirm.'
             return $result
         }
         $result.Windows = $perWindow
@@ -13823,7 +14381,7 @@ function Get-ReportRunConfig {
                        'ClientSecret','Credential','Days','IncludeDeliveryGroups',
                        'IncludeApplications','IncludeClientDevices','IncludeTrend',
                        'Anonymize','ExportRawData','ExportForMerge','SaltPath',
-                       'AllowUnanonymizedMergeExport','IdentityMapPath')
+                       'AllowUnanonymizedMergeExport','IdentityMapPath','FetchConcurrency')
         $ignored = @($ignorable | Where-Object { $BoundParameters.ContainsKey($_) })
         if ($ignored.Count -gt 0) {
             Write-ReportLog -Level Warn -Message ("No connection details were supplied on the command line, so this run is being configured from the dialog and these parameter(s) are IGNORED: -{0}. Set them in the dialog instead, or add -DeliveryController / -CustomerId / -DemoData to run non-interactively." -f ($ignored -join ', -'))
@@ -13936,7 +14494,8 @@ function Get-ReportRunConfig {
         -AllowUnanonymizedMergeExport:([bool] $BoundParameters['AllowUnanonymizedMergeExport']) `
         -IdentityMapPath ([string] $BoundParameters['IdentityMapPath']) `
         -ExportRawData:([bool] $BoundParameters['ExportRawData']) `
-        -DemoData:([bool] $BoundParameters['DemoData'])
+        -DemoData:([bool] $BoundParameters['DemoData']) `
+        -FetchConcurrency $(if ($BoundParameters.ContainsKey('FetchConcurrency')) { [int] $BoundParameters['FetchConcurrency'] } else { 4 })
 
     Test-ReportConfig -Config $config
 
@@ -14410,6 +14969,12 @@ function Invoke-ReportRun {
 
         if ($widest.IsTruncated) {
             Write-ReportLog -Level Warn -Message "  NOTE: the $($widest.Days)-day window is truncated to $($widest.AvailableDays) days of retained history. The figures are a lower bound."
+        }
+
+        $runWarnings = @()
+        if ($analysis.PSObject.Properties['FetchWarnings']) { $runWarnings = @($analysis.FetchWarnings) }
+        if (Test-SessionFetchIncomplete -Warnings $runWarnings) {
+            Write-ReportLog -Level Warn -Message '  NOTE: not every session was read, so every figure above is a lower bound. See the warning at the top of the report.'
         }
 
         if ($map) {

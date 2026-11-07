@@ -1,5 +1,56 @@
 # Release notes — Citrix Usage Report Tool (CURT)
 
+## 1.15.0
+
+**Faster on large sites**
+
+- **Sessions are read a day at a time, four requests at once.** Before, one
+  long query read every session in order, and on-premises sites slow down
+  the further into a query they get. On a test of 50,000 sessions shaped
+  like a large site, the read took about 12 seconds instead of 145. The new
+  `-FetchConcurrency` option (1 to 8, default 4) sets how many requests go
+  at once; use 1 if the Delivery Controller is under strain. A request that
+  fails is retried as before, and its day carries on from where it stopped.
+- Connections and application instances are read the same way, a day at a
+  time.
+- **The analysis is about eight times faster.** For each period, the script
+  now works out each session's place in the period once, and every figure
+  reuses it. On one site's 489,268 sessions, a 30-day analysis took 85
+  seconds instead of nearly 12 minutes. Every figure is the same as before.
+- `sessions.csv` is written directly, much faster on sites with millions of
+  sessions. Its content is unchanged.
+
+## 1.14.4
+
+**Large sites**
+
+- **Fixed:** on large sites the peak, the percentiles, the unique users and
+  the total sessions could be far below the real figures, and nearly the same
+  for 30, 60 and 90 days. The script stopped reading after 5000 pages, and
+  some sites send only 100 records a page, so it kept an arbitrary 500,000
+  sessions. One site reported a peak of about 2,500 against a true 6,925. The
+  report carried a "not fetched completely" banner, but the figures looked
+  complete. **Reports from large sites made with an earlier version should be
+  run again**, as should their exports for combining.
+- The same limit cut short the application breakdown on large sites. It now
+  reads up to 25 million records per query, whatever the page size.
+- If session data is ever incomplete, every headline figure is marked
+  **Lower bound**, `summary.csv` has a new `SessionsIncomplete` column, and
+  the console says so at the end of the run.
+- A combined report now warns, naming the site, when one site's export did
+  not read every session. Before, it carried no warning at all.
+- **Find a user** says "cannot confirm" rather than "not counted" for a run
+  that did not read every session, including reports made with earlier
+  versions.
+- A brief network or server outage no longer ends a long run: each page is
+  tried up to 8 times, over about two minutes, rather than 5.
+- A long Citrix Cloud run can renew its sign-in as often as it needs to.
+- Exports for combining are written compactly: about half the size, and
+  quicker to write and read, which matters on sites with millions of
+  sessions.
+- `daily-trend.csv` writes dates as `2026-10-04` rather than in the
+  machine's own format, which a reader elsewhere could misread.
+
 ## 1.14.3 — first public release
 
 This release is the first published at
