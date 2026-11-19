@@ -1,8 +1,8 @@
 ﻿#requires -Version 5.1
 # ============================================================================
 #  Citrix Usage Report - GENERATED FILE, DO NOT EDIT DIRECTLY
-#  Version: 1.15.0
-#  Built  : 2026-11-07T08:27:07Z
+#  Version: 1.16.0
+#  Built  : 2026-11-18T06:04:03Z
 #  Source : https://github.com/citrix/citrix-usage-report-tool-curt
 # ============================================================================
 
@@ -335,8 +335,8 @@ param(
 # placeholders in place. That reports as a development build rather than
 # claiming a release number it has not been through the build for.
 # ---------------------------------------------------------------------------
-$script:ReportVersion = '1.15.0'
-$script:ReportBuiltUtc = '2026-11-07T08:27:07Z'
+$script:ReportVersion = '1.16.0'
+$script:ReportBuiltUtc = '2026-11-18T06:04:03Z'
 
 # Where this script lives, captured while $PSCommandPath is still in scope.
 #
@@ -496,7 +496,7 @@ function Initialize-ReportLog {
         $header = @(
             '============================================================',
             ' Citrix Usage Report - run log',
-            " Started (UTC): $([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))",
+            " Started (UTC): $([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture))",
             " Host          : $($env:COMPUTERNAME)",
             " User          : $($env:USERDOMAIN)\$($env:USERNAME)",
             " PowerShell    : $($PSVersionTable.PSVersion)",
@@ -537,7 +537,7 @@ function Write-ReportLog {
     )
 
     $safe = Get-RedactedText -Text $Message
-    $stamp = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $stamp = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
     $line = '{0}  [{1,-7}] {2}' -f $stamp, $Level.ToUpperInvariant(), $safe
 
     switch ($Level) {
@@ -1293,6 +1293,56 @@ function Get-AuthRequestParameters {
     return $params
 }
 
+function Disable-CleartextHttpAuthentication {
+    <#
+    .SYNOPSIS
+        Stops this process answering a Basic sign-in challenge, and returns
+        what it removed so Restore-HttpAuthentication can put it back.
+    .DESCRIPTION
+        A supplied account answers whichever sign-in scheme the server asks
+        for. Monitor asks for Negotiate or NTLM, which never send the
+        password. Over plain HTTP, though, anyone between this machine and
+        the server can change the question to Basic, and Basic sends the
+        password as readable text. With Basic unregistered there is nothing
+        to downgrade to.
+
+        Used only for an on-premises run over HTTP with a supplied account:
+        over HTTPS the channel is already private, and the signed-in user's
+        own credentials are never sent as Basic.
+    .OUTPUTS
+        The removed modules, as an array (empty when none were registered).
+    #>
+    [CmdletBinding()]
+    param()
+
+    $modules = New-Object System.Collections.Generic.List[object]
+    $all = [System.Net.AuthenticationManager]::RegisteredModules
+    while ($all.MoveNext()) { $modules.Add($all.Current) }
+
+    $removed = New-Object System.Collections.Generic.List[object]
+    foreach ($m in $modules) {
+        if ($m.AuthenticationType -eq 'Basic') {
+            [System.Net.AuthenticationManager]::Unregister($m)
+            $removed.Add($m)
+        }
+    }
+    return $removed.ToArray()
+}
+
+function Restore-HttpAuthentication {
+    <#
+    .SYNOPSIS
+        Puts back what Disable-CleartextHttpAuthentication removed, so the
+        PowerShell session the report ran in is left as it was found.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyCollection()] $Modules)
+
+    foreach ($m in @($Modules)) {
+        if ($m) { [System.Net.AuthenticationManager]::Register($m) }
+    }
+}
+
 # endregion 30-Auth.ps1
 
 # ----------------------------------------------------------------------------
@@ -1405,6 +1455,74 @@ function Test-SessionFetchIncomplete {
     return [bool] @($Warnings | Where-Object {
         $_ -and $_.PSObject.Properties['Entity'] -and $_.Entity -eq 'Sessions'
     }).Count
+}
+
+# The Monitor address that has answered with real data in this session.
+# Until one has, a failure with no HTTP status (no connection at all) is
+# most likely a wrong host name and is reported at once. After one has, the
+# same failure is a dropped connection in the middle of a long read, and is
+# retried like any other passing fault.
+$script:ODataReachedBase = $null
+
+function Test-ODataPageShape {
+    <#
+    .SYNOPSIS
+        Whether a response is a page of OData records.
+    .DESCRIPTION
+        A proxy, a gateway or a sign-in page can answer 200 with HTML.
+        Invoke-RestMethod hands that back as XML or text without complaint,
+        and read as a page it looks like the last page of the query: no
+        records, no link to the next. The rest of the data would be dropped
+        with nothing to say so.
+    #>
+    param($Response)
+
+    if ($null -eq $Response) { return $false }
+    if ($Response -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+    return [bool] $Response.PSObject.Properties['value']
+}
+
+function Resolve-ODataNextLink {
+    <#
+    .SYNOPSIS
+        The address of the next page, always on the server the run was
+        pointed at.
+    .DESCRIPTION
+        The link to the next page comes from the response, and the request
+        for it carries the run's credentials. Followed as written, a response
+        tampered with in transit (an on-premises run over HTTP) could send
+        those credentials to any host it named. Only the path and query are
+        taken from the link; the scheme, host and port are always the
+        configured ones.
+
+        That also makes a site behind a load balancer or TLS offloader work
+        when its links name the internal server or http://.
+    .OUTPUTS
+        [string]
+    #>
+    param([string] $Next, [string] $Base)
+
+    $baseUri = [uri] $Base
+    $nextUri = $null
+    if (-not [uri]::TryCreate($Next, [System.UriKind]::Absolute, [ref] $nextUri)) {
+        # A relative link: resolved against the service root.
+        return (New-Object System.Uri (([uri] ($Base.TrimEnd('/') + '/')), $Next)).AbsoluteUri
+    }
+    # Returned exactly as written, so the repeating-link guard compares like
+    # with like.
+    if ($nextUri.Scheme -eq $baseUri.Scheme -and $nextUri.Host -eq $baseUri.Host -and $nextUri.Port -eq $baseUri.Port) {
+        return $Next
+    }
+
+    $builder = New-Object System.UriBuilder $nextUri
+    $builder.Scheme = $baseUri.Scheme
+    $builder.Host = $baseUri.Host
+    $builder.Port = $(if ($baseUri.IsDefaultPort) { -1 } else { $baseUri.Port })
+    if (-not $script:ODataNextLinkRewriteLogged) {
+        $script:ODataNextLinkRewriteLogged = $true
+        Write-ReportLog -Level Debug -Message "The server's paging links name $($nextUri.Scheme)://$($nextUri.Host); following them on $($baseUri.Scheme)://$($baseUri.Host) instead."
+    }
+    return $builder.Uri.AbsoluteUri
 }
 
 function New-ODataHttpError {
@@ -1800,7 +1918,10 @@ function ConvertTo-ODataDateLiteral {
     # A local or unspecified time would shift every window boundary by the
     # machine's offset, so convert defensively.
     if ($Utc.Kind -ne [System.DateTimeKind]::Utc) { $Utc = $Utc.ToUniversalTime() }
-    return $Utc.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    # Invariant: under a culture whose calendar is not Gregorian (th-TH,
+    # ar-SA) the machine's own formatting writes a different YEAR, and the
+    # filter would ask the server for the wrong period.
+    return $Utc.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
 function Build-ODataUrl {
@@ -1868,10 +1989,19 @@ function Invoke-CitrixODataQuery {
         # concurrent fetch (Invoke-CitrixODataSlicedQuery) hands over a slice
         # whose page failed, so the retries and error messages here apply to
         # it unchanged.
-        [string] $StartUrl
+        [string] $StartUrl,
+
+        # Called with each page's records as they arrive, in place of
+        # collecting them. The caller converts them to what it keeps there
+        # and then, so the raw records of a multi-million-row read are never
+        # all held at once: raw and converted together were about 4.4 GB per
+        # million sessions. With -PageAction the function returns the NUMBER
+        # of records read, not the records.
+        [scriptblock] $PageAction
     )
 
     $results = New-Object System.Collections.Generic.List[object]
+    $count = 0
     $url = $StartUrl
     if (-not $url) {
         $url = Build-ODataUrl -Base $AuthContext.ODataBase -Entity $Entity `
@@ -1898,7 +2028,7 @@ function Invoke-CitrixODataQuery {
         Assert-NotCancelled
 
         if ($CancellationCheck -and (& $CancellationCheck)) {
-            Write-ReportLog -Level Warn -Message "Canceled while fetching $Entity after $($results.Count) records."
+            Write-ReportLog -Level Warn -Message "Canceled while fetching $Entity after $($count) records."
             break
         }
 
@@ -1914,6 +2044,11 @@ function Invoke-CitrixODataQuery {
                 $response = Invoke-RestMethod -Uri $url -Method Get `
                     -Headers $AuthContext.GetHeaders() -UseBasicParsing `
                     -TimeoutSec 300 -ErrorAction Stop @extra
+                if (-not (Test-ODataPageShape $response)) {
+                    $response = $null
+                    throw (New-Object System.IO.InvalidDataException 'the server answered, but not with Monitor data (a proxy, gateway or sign-in page may have answered instead)')
+                }
+                $script:ODataReachedBase = $AuthContext.ODataBase
                 break
             } catch {
                 $status = Get-ODataStatusCode -ErrorRecord $_
@@ -1971,6 +2106,16 @@ function Invoke-CitrixODataQuery {
                 }
 
                 $retryable = $script:ODataRetryableStatus -contains $status
+
+                # No status at all: the connection dropped, timed out or
+                # could not be made, or the answer was not Monitor data. In
+                # the middle of a read of tens of thousands of pages that is
+                # a passing fault and one of them must not end the run.
+                # Before this server has ever answered it is far more likely
+                # a wrong host name, which the user needs to hear now, not
+                # after two minutes of retries.
+                if (-not $status -and $script:ODataReachedBase -eq $AuthContext.ODataBase) { $retryable = $true }
+
                 if (-not $retryable -or $attempt -ge $MaxAttempts) {
                     $detail = if ($status) { "HTTP $status" } else { $_.Exception.Message }
                     # Thrown as an exception carrying the status code rather
@@ -1998,55 +2143,66 @@ function Invoke-CitrixODataQuery {
                     $delay = $retryAfter
                 }
 
-                Write-ReportLog -Level Warn -Message "HTTP $status fetching $Entity; retrying in $delay s (attempt $attempt of $MaxAttempts).$serverDetail"
+                $what = if ($status) { "HTTP $status" } else { "No answer ($($_.Exception.Message))" }
+                Write-ReportLog -Level Warn -Message "$what fetching $Entity; retrying in $delay s (attempt $attempt of $MaxAttempts).$serverDetail"
                 Start-Sleep -Seconds $delay
             }
         }
 
         $page++
         $batch = @($response.value)
-        foreach ($item in $batch) { [void] $results.Add($item) }
+        if ($PageAction) {
+            $records = New-Object System.Collections.Generic.List[object]
+            foreach ($item in $batch) { if ($null -ne $item) { $records.Add($item) } }
+            $count += $records.Count
+            $null = & $PageAction $records.ToArray()
+        } else {
+            foreach ($item in $batch) { if ($null -ne $item) { [void] $results.Add($item) } }
+            $count = $results.Count
+        }
 
-        if ($ProgressAction) { & $ProgressAction $Entity $results.Count }
+        if ($ProgressAction) { & $ProgressAction $Entity $count }
 
         # A page that arrived means the credentials work, so a later 401 is
         # a token that expired since, which earns its own refresh. One
         # refresh per query would fail any query outlasting two tokens.
         $refreshedOn401 = $false
 
-        if ($MaxRecords -gt 0 -and $results.Count -ge $MaxRecords) {
+        if ($MaxRecords -gt 0 -and $count -ge $MaxRecords) {
             Write-ReportLog -Level Warn -Message "Reached the $MaxRecords record cap for $Entity; results are truncated."
-            Add-ODataFetchWarning -Entity $Entity -Reason 'RecordCap' -RecordCount $results.Count `
-                -Message "Only the first $($results.Count) $Entity record(s) were read before the record cap was reached, and pages do not arrive in time order, so the records that were dropped are an arbitrary subset."
+            Add-ODataFetchWarning -Entity $Entity -Reason 'RecordCap' -RecordCount $count `
+                -Message "Only the first $($count) $Entity record(s) were read before the record cap was reached, and pages do not arrive in time order, so the records that were dropped are an arbitrary subset."
             break
         }
 
         if ($MaxPages -gt 0 -and $page -ge $MaxPages) {
             Write-ReportLog -Level Warn -Message "Reached the maximum of $MaxPages page(s) fetching $Entity without the server signalling completion; stopping to avoid an unbounded run. Results may be incomplete."
-            Add-ODataFetchWarning -Entity $Entity -Reason 'PageCap' -RecordCount $results.Count `
-                -Message "The server was still returning $Entity pages after $MaxPages page(s) ($($results.Count) record(s)), so the fetch was stopped. Pages do not arrive in time order, so the records that were dropped are an arbitrary subset."
+            Add-ODataFetchWarning -Entity $Entity -Reason 'PageCap' -RecordCount $count `
+                -Message "The server was still returning $Entity pages after $MaxPages page(s) ($($count) record(s)), so the fetch was stopped. Pages do not arrive in time order, so the records that were dropped are an arbitrary subset."
             break
         }
 
         # OData v4 signals more data with @odata.nextLink. Ignoring it would
         # silently truncate every large site to its first 1000 records.
         $next = $response.PSObject.Properties['@odata.nextLink']
-        if (-not $next) {
+        $nextUrl = $null
+        if ($next -and $next.Value) { $nextUrl = Resolve-ODataNextLink -Next ([string] $next.Value) -Base $AuthContext.ODataBase }
+        if (-not $nextUrl) {
             $url = $null
-        } elseif ($seenUrls.Contains($next.Value)) {
+        } elseif ($seenUrls.Contains($nextUrl)) {
             # A server returning a non-advancing nextLink would otherwise loop
             # forever. Truncation must never be silent, so this is a warning,
             # not a quiet stop.
             Write-ReportLog -Level Warn -Message "The server returned a repeating pagination link while fetching $Entity; stopping to avoid an infinite loop. Results may be incomplete."
-            Add-ODataFetchWarning -Entity $Entity -Reason 'RepeatingPageLink' -RecordCount $results.Count `
-                -Message "The server returned a repeating pagination link while fetching $Entity, so the fetch was stopped after $($results.Count) record(s) to avoid an infinite loop."
+            Add-ODataFetchWarning -Entity $Entity -Reason 'RepeatingPageLink' -RecordCount $count `
+                -Message "The server returned a repeating pagination link while fetching $Entity, so the fetch was stopped after $($count) record(s) to avoid an infinite loop."
             $url = $null
         } else {
-            $url = $next.Value
+            $url = $nextUrl
         }
     }
 
-    Write-ReportLog -Level Debug -Message "$Entity : $($results.Count) record(s) over $page page(s)."
+    Write-ReportLog -Level Debug -Message "$Entity : $($count) record(s) over $page page(s)."
     # Plain return, not a unary-comma-wrapped one: `@(Invoke-CitrixODataQuery
     # ...)` at the call site (see 50-DataModel.ps1) is the codebase's
     # standard way to get a reliably correct count for zero, one, or many
@@ -2056,7 +2212,30 @@ function Invoke-CitrixODataQuery {
     # than the scalar-collapse bug the comma was added to prevent, and is
     # also mock-incompatible: tests (and Task 6's preflight) mock this
     # function's return as a plain array.
+    if ($PageAction) { return $count }
     return $results.ToArray()
+}
+
+function Complete-ODataPageAction {
+    <#
+    .SYNOPSIS
+        What a -PageAction query read, as a count, whatever it returned.
+    .DESCRIPTION
+        A query given -PageAction hands its records to the action and
+        returns their number. A stand-in for it (the test suite replaces
+        these functions with ones that simply return records) returns the
+        records instead; those are handed to the action here, so the caller
+        ends up in the same state either way.
+    .OUTPUTS
+        [int]
+    #>
+    param($Returned, [scriptblock] $PageAction)
+
+    $items = @($Returned)
+    if ($items.Count -eq 1 -and $items[0] -is [int]) { return $items[0] }
+    $records = @($items | Where-Object { $null -ne $_ })
+    if ($records.Count -gt 0) { $null = & $PageAction $records }
+    return $records.Count
 }
 
 # How many page requests a sliced fetch keeps in flight. The Monitor
@@ -2097,10 +2276,15 @@ function Invoke-CitrixODataSlicedQuery {
         [int] $Concurrency = $script:ODataDefaultConcurrency,
         [int] $MaxRecords = $script:ODataMaxRecords,
         [scriptblock] $ProgressAction,
-        [scriptblock] $CancellationCheck
+        [scriptblock] $CancellationCheck,
+
+        # As on Invoke-CitrixODataQuery: each page's records are handed over
+        # as they arrive, and the function returns how many were read.
+        [scriptblock] $PageAction
     )
 
     $results = New-Object System.Collections.Generic.List[object]
+    $count = 0
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $pages = 0
     Write-ReportLog -Level Debug -Message "OData GET $Entity in $($Filters.Count) slice(s), up to $Concurrency request(s) at a time"
@@ -2109,20 +2293,21 @@ function Invoke-CitrixODataSlicedQuery {
     # Reached between slices, not inside one, so Invoke-CitrixODataQuery's
     # own cap does not see it.
     function Test-SliceCapReached {
-        if ($MaxRecords -le 0 -or $results.Count -lt $MaxRecords) { return $false }
+        if ($MaxRecords -le 0 -or $count -lt $MaxRecords) { return $false }
         $already = @(Get-ODataFetchWarnings | Where-Object { $_.Entity -eq $Entity -and $_.Reason -eq 'RecordCap' })
         if ($already.Count -eq 0) {
             Write-ReportLog -Level Warn -Message "Reached the $MaxRecords record cap for $Entity; results are truncated."
-            Add-ODataFetchWarning -Entity $Entity -Reason 'RecordCap' -RecordCount $results.Count `
-                -Message "Only the first $($results.Count) $Entity record(s) were read before the record cap was reached, and pages do not arrive in time order, so the records that were dropped are an arbitrary subset."
+            Add-ODataFetchWarning -Entity $Entity -Reason 'RecordCap' -RecordCount $count `
+                -Message "Only the first $($count) $Entity record(s) were read before the record cap was reached, and pages do not arrive in time order, so the records that were dropped are an arbitrary subset."
         }
         return $true
     }
 
     # Reads the rest of one slice through the one-page-at-a-time loop, from
-    # the slice's first page or from the page that just failed.
+    # the slice's first page or from the page that just failed. Returns how
+    # many records that added.
     function Read-SliceSequentially([string] $SliceFilter, [string] $From) {
-        $base = $results.Count
+        $base = $count
         $progress = $null
         if ($ProgressAction) {
             $outer = $ProgressAction
@@ -2130,20 +2315,28 @@ function Invoke-CitrixODataSlicedQuery {
         }
         # Never 0 here: to Invoke-CitrixODataQuery, 0 means no cap at all.
         $remaining = 0
-        if ($MaxRecords -gt 0) { $remaining = [math]::Max(1, $MaxRecords - $results.Count) }
+        if ($MaxRecords -gt 0) { $remaining = [math]::Max(1, $MaxRecords - $count) }
+        if ($PageAction) {
+            $returned = Invoke-CitrixODataQuery -AuthContext $AuthContext -Entity $Entity -Select $Select `
+                -Filter $SliceFilter -StartUrl $From -MaxRecords $remaining `
+                -ProgressAction $progress -CancellationCheck $CancellationCheck -PageAction $PageAction
+            return (Complete-ODataPageAction -Returned $returned -PageAction $PageAction)
+        }
         $batch = @(Invoke-CitrixODataQuery -AuthContext $AuthContext -Entity $Entity -Select $Select `
             -Filter $SliceFilter -StartUrl $From -MaxRecords $remaining `
             -ProgressAction $progress -CancellationCheck $CancellationCheck)
         foreach ($item in $batch) { [void] $results.Add($item) }
+        return $batch.Count
     }
 
     if ($Concurrency -le 1) {
         foreach ($f in $Filters) {
             if (Test-SliceCapReached) { break }
-            Read-SliceSequentially $f $null
+            $count += Read-SliceSequentially $f $null
             if ($CancellationCheck -and (& $CancellationCheck)) { break }
         }
-        Write-ReportLog -Level Debug -Message "$Entity : $($results.Count) record(s) in $([int] $sw.Elapsed.TotalSeconds) s."
+        Write-ReportLog -Level Debug -Message "$Entity : $($count) record(s) in $([int] $sw.Elapsed.TotalSeconds) s."
+        if ($PageAction) { return $count }
         return $results.ToArray()
     }
 
@@ -2160,9 +2353,9 @@ function Invoke-CitrixODataSlicedQuery {
         try {
             $r = Invoke-RestMethod -Uri $Url -Method Get -Headers $Headers -UseBasicParsing `
                 -TimeoutSec 300 -ErrorAction Stop @Extra
-            [pscustomobject]@{ Ok = $true; Response = $r }
+            [pscustomobject]@{ Ok = $true; Response = $r; Error = $null }
         } catch {
-            [pscustomobject]@{ Ok = $false; Response = $null }
+            [pscustomobject]@{ Ok = $false; Response = $null; Error = [string] $_.Exception.Message }
         }
     }.ToString()
 
@@ -2205,7 +2398,7 @@ function Invoke-CitrixODataSlicedQuery {
 
             Assert-NotCancelled
             if ($CancellationCheck -and (& $CancellationCheck)) {
-                Write-ReportLog -Level Warn -Message "Canceled while fetching $Entity after $($results.Count) records."
+                Write-ReportLog -Level Warn -Message "Canceled while fetching $Entity after $($count) records."
                 break
             }
             if ($done -eq [System.Threading.WaitHandle]::WaitTimeout) { continue }
@@ -2218,35 +2411,47 @@ function Invoke-CitrixODataSlicedQuery {
             $r = $null
             if ($out.Count -gt 0) { $r = $out[0] }
 
-            if (-not $r -or -not $r.Ok) {
-                Write-ReportLog -Level Debug -Message "A $Entity page failed; reading the rest of that slice one page at a time, with retries."
-                Read-SliceSequentially $slice.Filter $slice.Url
+            if (-not $r -or -not $r.Ok -or -not (Test-ODataPageShape $r.Response)) {
+                $why = 'no result'
+                if ($r -and $r.Ok) { $why = 'the answer was not Monitor data' } elseif ($r -and $r.Error) { $why = $r.Error }
+                Write-ReportLog -Level Debug -Message "A $Entity page failed ($why); reading the rest of that slice one page at a time, with retries."
+                $count += Read-SliceSequentially $slice.Filter $slice.Url
                 if ((Test-SliceCapReached) -or ($CancellationCheck -and (& $CancellationCheck))) { $stopped = $true }
                 continue
             }
 
             $pages++
-            foreach ($item in @($r.Response.value)) { [void] $results.Add($item) }
-            if ($ProgressAction) { & $ProgressAction $Entity $results.Count }
+            $script:ODataReachedBase = $AuthContext.ODataBase
+            if ($PageAction) {
+                $records = New-Object System.Collections.Generic.List[object]
+                foreach ($item in @($r.Response.value)) { if ($null -ne $item) { $records.Add($item) } }
+                $count += $records.Count
+                $null = & $PageAction $records.ToArray()
+            } else {
+                foreach ($item in @($r.Response.value)) { if ($null -ne $item) { [void] $results.Add($item) } }
+                $count = $results.Count
+            }
+            if ($ProgressAction) { & $ProgressAction $Entity $count }
 
             # The rate, so a slow server shows in the run log rather than
             # being guessed at from the start and end times.
             if ($pages % 500 -eq 0) {
                 Write-ReportLog -Level Debug -Message ('{0} : {1} record(s) over {2} page(s) so far, {3:N0} ms a page' -f `
-                    $Entity, $results.Count, $pages, ($sw.Elapsed.TotalMilliseconds / $pages))
+                    $Entity, $count, $pages, ($sw.Elapsed.TotalMilliseconds / $pages))
             }
 
             if (Test-SliceCapReached) { $stopped = $true; continue }
 
             $next = $r.Response.PSObject.Properties['@odata.nextLink']
-            if (-not $next) { continue }
-            if ($slice.Seen.Contains($next.Value)) {
+            if (-not $next -or -not $next.Value) { continue }
+            $nextUrl = Resolve-ODataNextLink -Next ([string] $next.Value) -Base $AuthContext.ODataBase
+            if ($slice.Seen.Contains($nextUrl)) {
                 Write-ReportLog -Level Warn -Message "The server returned a repeating pagination link while fetching $Entity; stopping to avoid an infinite loop. Results may be incomplete."
-                Add-ODataFetchWarning -Entity $Entity -Reason 'RepeatingPageLink' -RecordCount $results.Count `
-                    -Message "The server returned a repeating pagination link while fetching $Entity, so the fetch was stopped after $($results.Count) record(s) to avoid an infinite loop."
+                Add-ODataFetchWarning -Entity $Entity -Reason 'RepeatingPageLink' -RecordCount $count `
+                    -Message "The server returned a repeating pagination link while fetching $Entity, so the fetch was stopped after $($count) record(s) to avoid an infinite loop."
                 continue
             }
-            $slice.Url = $next.Value
+            $slice.Url = $nextUrl
             $ready.Insert(0, $slice)
         }
     } finally {
@@ -2259,7 +2464,8 @@ function Invoke-CitrixODataSlicedQuery {
     }
 
     Write-ReportLog -Level Debug -Message ('{0} : {1} record(s) over {2} page(s) in {3} s.' -f `
-        $Entity, $results.Count, $pages, [int] $sw.Elapsed.TotalSeconds)
+        $Entity, $count, $pages, [int] $sw.Elapsed.TotalSeconds)
+    if ($PageAction) { return $count }
     return $results.ToArray()
 }
 
@@ -2298,6 +2504,45 @@ function ConvertTo-UtcDateTime {
 
 $script:UtcParseStyles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor
                          [System.Globalization.DateTimeStyles]::AssumeUniversal
+
+# The characters a spreadsheet takes as the start of a formula.
+$script:CsvFormulaLead = "=+-@`t`r"
+
+function ConvertTo-CsvSafeText($Value) {
+    # A cell that begins with = + - or @ is run as a formula by Excel and
+    # most spreadsheets when the file is opened. The names in these files
+    # come from the directory, and in a combined run from files other people
+    # supplied, so one of them can be written to do that on purpose. An
+    # apostrophe in front is the standard way to make a spreadsheet show the
+    # cell as text. ConvertFrom-CsvSafeText takes it off again on reading.
+    if ($null -eq $Value) { return $Value }
+    $text = [string] $Value
+    if ($text.Length -gt 0 -and $script:CsvFormulaLead.IndexOf($text[0]) -ge 0) { return "'" + $text }
+    return $text
+}
+
+function ConvertFrom-CsvSafeText($Value) {
+    # The reverse: only an apostrophe that ConvertTo-CsvSafeText would have
+    # added is removed, so a real name beginning with one is left alone.
+    if ($null -eq $Value) { return $Value }
+    $text = [string] $Value
+    if ($text.Length -gt 1 -and $text[0] -eq "'" -and $script:CsvFormulaLead.IndexOf($text[1]) -ge 0) {
+        return $text.Substring(1)
+    }
+    return $text
+}
+
+function ConvertFrom-CsvSafeRows($Rows) {
+    # Every cell of every row read back from one of this tool's CSV files.
+    foreach ($row in @($Rows)) {
+        foreach ($prop in $row.PSObject.Properties) {
+            if ($prop.Value -is [string] -and $prop.Value.Length -gt 1 -and $prop.Value[0] -eq "'") {
+                $prop.Value = ConvertFrom-CsvSafeText $prop.Value
+            }
+        }
+        $row
+    }
+}
 
 function ConvertTo-UtcDateTimeCore($Value) {
     # A PLAIN function for the same reason as Get-ClampedSessionIntervalCore:
@@ -2516,7 +2761,7 @@ function Invoke-ReportPreflight {
     }
 
     if ($oldestStart -and $oldestEnd -and $oldestStart -lt $historyStart) {
-        Write-ReportLog -Level Info -Message ("The oldest session on this site started {0:yyyy-MM-dd} and is still running; retention is measured from the oldest ENDED session ({1:yyyy-MM-dd}) because open sessions are never groomed." -f $oldestStart, $oldestEnd)
+        Write-ReportLog -Level Info -Message ([string]::Format([System.Globalization.CultureInfo]::InvariantCulture, "The oldest session on this site started {0:yyyy-MM-dd} and is still running; retention is measured from the oldest ENDED session ({1:yyyy-MM-dd}) because open sessions are never groomed.", $oldestStart, $oldestEnd))
     }
 
     [pscustomobject]@{
@@ -2549,32 +2794,79 @@ function Get-CitrixSessionRecords {
     # at a time.
     $filters = Get-SessionSliceFilters -StartUtc $Config.WidestWindowStartUtc -EndUtc $Config.WindowEndUtc
 
-    $raw = Invoke-CitrixODataSlicedQuery -AuthContext $AuthContext -Entity 'Sessions' `
-        -Select @('SessionKey','UserId','MachineId','StartDate','EndDate','SessionType','IsAnonymous','ConnectionState','LifecycleState') `
-        -Filters $filters -Concurrency (Get-ReportFetchConcurrency -Config $Config) `
-        -ProgressAction $ProgressAction -CancellationCheck $CancellationCheck
-
     # Once per session key. The slices cannot overlap, but a page boundary
     # can still shift under a live site -- a session added mid-fetch moves
     # every later row of its slice down one -- and a session counted twice
     # would add a phantom one to the peak.
-    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
-    foreach ($r in $raw) {
-        $key = [string] $r.SessionKey
-        # A blank key identifies nothing, so it is never taken as a repeat.
-        if ($key -and -not $seen.Add($key)) { continue }
-        $type = 0
-        if ($null -ne $r.SessionType) { $type = [int] $r.SessionType }
-        [pscustomobject]@{
-            SessionKey  = $key
-            UserId      = [string] $r.UserId
-            MachineId   = [string] $r.MachineId
-            StartUtc    = ConvertTo-UtcDateTimeCore $r.StartDate
-            EndUtc      = ConvertTo-UtcDateTimeCore $r.EndDate
-            SessionType = $type
-            IsAnonymous = [bool] $r.IsAnonymous
+    $sessionKeys = New-Object 'System.Collections.Generic.HashSet[string]'
+    $projected = New-Object System.Collections.Generic.List[object]
+
+    # Each page is converted as it arrives and its raw records let go, so a
+    # site with millions of sessions never holds both forms of all of them.
+    #
+    # The date conversion is ConvertTo-UtcDateTimeCore written out in place,
+    # and nothing here calls one of this script's own functions: this block
+    # is a closure, and a closure looks commands up in the GLOBAL scope when
+    # they are not its own, which is not where a dot-sourced function lives.
+    # (A function call per date was also most of the time this loop took.)
+    $styles = $script:UtcParseStyles
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    $utc = [System.DateTimeKind]::Utc
+    $onPage = {
+        param($records)
+        foreach ($r in $records) {
+            if ($null -eq $r) { continue }
+            $key = [string] $r.SessionKey
+            # A blank key identifies nothing, so it is never taken as a repeat.
+            if ($key -and -not $sessionKeys.Add($key)) { continue }
+
+            $type = 0
+            if ($null -ne $r.SessionType) { $type = [int] $r.SessionType }
+
+            $start = $null
+            $value = $r.StartDate
+            if ($value -is [datetime]) {
+                $start = $(if ($value.Kind -eq $utc) { $value } else { $value.ToUniversalTime() })
+            } elseif ($null -ne $value -and $value -ne '') {
+                $parsed = [datetime]::MinValue
+                if ([datetime]::TryParse([string] $value, $invariant, $styles, [ref] $parsed)) {
+                    $start = [datetime]::SpecifyKind($parsed, $utc)
+                }
+            }
+
+            $end = $null
+            $value = $r.EndDate
+            if ($value -is [datetime]) {
+                $end = $(if ($value.Kind -eq $utc) { $value } else { $value.ToUniversalTime() })
+            } elseif ($null -ne $value -and $value -ne '') {
+                $parsed = [datetime]::MinValue
+                if ([datetime]::TryParse([string] $value, $invariant, $styles, [ref] $parsed)) {
+                    $end = [datetime]::SpecifyKind($parsed, $utc)
+                }
+            }
+
+            $projected.Add([pscustomobject]@{
+                SessionKey  = $key
+                UserId      = [string] $r.UserId
+                MachineId   = [string] $r.MachineId
+                StartUtc    = $start
+                EndUtc      = $end
+                SessionType = $type
+                IsAnonymous = [bool] $r.IsAnonymous
+            })
         }
-    }
+    }.GetNewClosure()
+
+    # ConnectionState and LifecycleState were requested here and never read;
+    # at 100 records a page they were a fifth of every response.
+    $returned = Invoke-CitrixODataSlicedQuery -AuthContext $AuthContext -Entity 'Sessions' `
+        -Select @('SessionKey','UserId','MachineId','StartDate','EndDate','SessionType','IsAnonymous') `
+        -Filters $filters -Concurrency (Get-ReportFetchConcurrency -Config $Config) `
+        -ProgressAction $ProgressAction -CancellationCheck $CancellationCheck -PageAction $onPage
+    $null = Complete-ODataPageAction -Returned $returned -PageAction $onPage
+
+    # Plain array; callers wrap in @().
+    return $projected.ToArray()
 }
 
 function Get-ReportFetchConcurrency {
@@ -2617,22 +2909,71 @@ function Get-CitrixLookupRecords {
         # instead of the single -Filter. For the large session-linked
         # entities; the small lookups never need it.
         [string[]] $Filters,
-        [int] $Concurrency = 1
+        [int] $Concurrency = 1,
+
+        # Fields whose text is a date, converted to a UTC DateTime (or $null)
+        # under the same name. Must also be in -Fields.
+        [string[]] $DateFields
     )
 
-    if ($Filters) {
-        $raw = Invoke-CitrixODataSlicedQuery -AuthContext $AuthContext -Entity $Entity `
-            -Select $Fields -Filters $Filters -Concurrency $Concurrency -ProgressAction $ProgressAction
-    } else {
+    if (-not $Filters) {
         $raw = Invoke-CitrixODataQuery -AuthContext $AuthContext -Entity $Entity `
             -Select $Fields -Filter $Filter -ProgressAction $ProgressAction
+        foreach ($r in $raw) {
+            $o = [ordered]@{}
+            foreach ($f in $Fields) { $o[$f] = $r.$f }
+            foreach ($f in $DateFields) { $o[$f] = ConvertTo-UtcDateTimeCore $r.$f }
+            [pscustomobject] $o
+        }
+        return
     }
 
-    foreach ($r in $raw) {
-        $o = [ordered]@{}
-        foreach ($f in $Fields) { $o[$f] = $r.$f }
-        [pscustomobject] $o
-    }
+    # The large, sliced entities: converted a page at a time, like sessions,
+    # and for the same reason. Once per Id, because a page boundary shifting
+    # under a live site repeats a row here exactly as it does a session, and
+    # a repeated launch or connection is counted twice.
+    $rows = New-Object System.Collections.Generic.List[object]
+    $ids = New-Object 'System.Collections.Generic.HashSet[string]'
+    $hasId = $Fields -contains 'Id'
+    $fieldNames = [string[]] $Fields
+    $dateNames = [string[]] @($DateFields | Where-Object { $_ })
+    $styles = $script:UtcParseStyles
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    $utc = [System.DateTimeKind]::Utc
+    # No calls to this script's own functions inside: see the note on the
+    # same block in Get-CitrixSessionRecords.
+    $onPage = {
+        param($records)
+        foreach ($r in $records) {
+            if ($null -eq $r) { continue }
+            if ($hasId) {
+                $id = [string] $r.Id
+                if ($id -and -not $ids.Add($id)) { continue }
+            }
+            $o = [ordered]@{}
+            foreach ($f in $fieldNames) { $o[$f] = $r.$f }
+            foreach ($f in $dateNames) {
+                $value = $r.$f
+                $date = $null
+                if ($value -is [datetime]) {
+                    $date = $(if ($value.Kind -eq $utc) { $value } else { $value.ToUniversalTime() })
+                } elseif ($null -ne $value -and $value -ne '') {
+                    $parsed = [datetime]::MinValue
+                    if ([datetime]::TryParse([string] $value, $invariant, $styles, [ref] $parsed)) {
+                        $date = [datetime]::SpecifyKind($parsed, $utc)
+                    }
+                }
+                $o[$f] = $date
+            }
+            $rows.Add([pscustomobject] $o)
+        }
+    }.GetNewClosure()
+
+    $returned = Invoke-CitrixODataSlicedQuery -AuthContext $AuthContext -Entity $Entity `
+        -Select $Fields -Filters $Filters -Concurrency $Concurrency -ProgressAction $ProgressAction `
+        -PageAction $onPage
+    $null = Complete-ODataPageAction -Returned $returned -PageAction $onPage
+    return $rows.ToArray()
 }
 
 function Get-SessionLinkedWindowFilter {
@@ -2725,23 +3066,24 @@ function Get-CitrixWindowedRecords {
         # The same bound cut into disjoint slices (Get-SessionLinkedSliceFilters),
         # used instead of -Filter when given.
         [string[]] $Filters,
-        [int] $Concurrency = 1
+        [int] $Concurrency = 1,
+        [string[]] $DateFields
     )
 
     if ($Filters) {
         $Filter = $Filters[0]
     } elseif ([string]::IsNullOrWhiteSpace($Filter)) {
         return @(Get-CitrixLookupRecords -AuthContext $AuthContext -Entity $Entity `
-            -Fields $Fields -ProgressAction $ProgressAction)
+            -Fields $Fields -ProgressAction $ProgressAction -DateFields $DateFields)
     }
 
     try {
         if ($Filters) {
             return @(Get-CitrixLookupRecords -AuthContext $AuthContext -Entity $Entity `
-                -Fields $Fields -Filters $Filters -Concurrency $Concurrency -ProgressAction $ProgressAction)
+                -Fields $Fields -Filters $Filters -Concurrency $Concurrency -ProgressAction $ProgressAction -DateFields $DateFields)
         }
         return @(Get-CitrixLookupRecords -AuthContext $AuthContext -Entity $Entity `
-            -Fields $Fields -Filter $Filter -ProgressAction $ProgressAction)
+            -Fields $Fields -Filter $Filter -ProgressAction $ProgressAction -DateFields $DateFields)
     } catch {
         if ((Get-ODataStatusCode -ErrorRecord $_) -ne 400) { throw }
 
@@ -2749,8 +3091,11 @@ function Get-CitrixWindowedRecords {
         Add-ODataFetchWarning -Entity $Entity -Reason 'UnboundedFetch' `
             -Message "$Entity could not be limited to the reporting period because this site rejected the date filter, so every retained $Entity record was requested instead. The figures derived from it are still correct unless a paging cap warning also appears."
 
+        # The date field is the likeliest thing the site refused, so it is
+        # not asked for again; what reads it treats a missing date as unknown.
+        $plain = [string[]] @($Fields | Where-Object { $DateFields -notcontains $_ })
         return @(Get-CitrixLookupRecords -AuthContext $AuthContext -Entity $Entity `
-            -Fields $Fields -ProgressAction $ProgressAction)
+            -Fields $plain -ProgressAction $ProgressAction)
     }
 }
 
@@ -2818,14 +3163,24 @@ function Get-CitrixDataset {
     $concurrency = Get-ReportFetchConcurrency -Config $Config
     $linkedSlices = {
         param([string] $DateField)
-        $windowStart = $Config.WidestWindowStartUtc
+        # A day at a time from the first day any fetched session started,
+        # not only inside the window. The stretch before the window holds
+        # every connection and launch the site retains for those days, not
+        # just the few belonging to sessions still running: read as one
+        # query it was the longest single read of a 7-day report on a
+        # 90-day site, with none of the slicing that makes the rest fast.
+        #
+        # Anything older than 180 days before the window is one slice: only
+        # a desktop left running for half a year reaches back that far, and
+        # the site has long since groomed everything else from those days.
+        $from = $linkedStartUtc
         $all = New-Object System.Collections.Generic.List[string]
-        if ($linkedStartUtc -lt $windowStart) {
-            $all.Add((Get-SessionLinkedWindowFilter -DateField $DateField -StartUtc $linkedStartUtc -EndUtc $windowStart))
-        } else {
-            $windowStart = $linkedStartUtc
+        $oldest = $Config.WidestWindowStartUtc.AddDays(-180)
+        if ($from -lt $oldest) {
+            $all.Add((Get-SessionLinkedWindowFilter -DateField $DateField -StartUtc $from -EndUtc $oldest))
+            $from = $oldest
         }
-        foreach ($f in @(Get-SessionLinkedSliceFilters -DateField $DateField -StartUtc $windowStart -EndUtc $Config.WindowEndUtc)) {
+        foreach ($f in @(Get-SessionLinkedSliceFilters -DateField $DateField -StartUtc $from -EndUtc $Config.WindowEndUtc)) {
             $all.Add($f)
         }
         return [string[]] $all.ToArray()
@@ -2860,7 +3215,7 @@ function Get-CitrixDataset {
         # projected object, so the live/demo shape parity the test suite pins
         # is unaffected.
         $appInstances = @(Get-CitrixWindowedRecords -AuthContext $AuthContext -Entity 'ApplicationInstances' `
-            -Fields @('Id','SessionKey','ApplicationId') `
+            -Fields @('Id','SessionKey','ApplicationId','StartDate') -DateFields @('StartDate') `
             -Filters (& $linkedSlices 'StartDate') -Concurrency $concurrency `
             -ProgressAction $ProgressAction)
         $applications = @(Get-CitrixLookupRecords -AuthContext $AuthContext -Entity 'Applications' `
@@ -3069,21 +3424,15 @@ function New-DemoDataset {
         if ($s.SessionType -eq 1) {
             $n = 1 + $rand.Next(0, 3)
             for ($a = 0; $a -lt $n; $a++) {
-                # No StartDate/EndDate: the live fetcher's ApplicationInstances
-                # select list omits them (nothing downstream reads them, and
-                # Get-CitrixLookupRecords never applies ConvertTo-UtcDateTime to
-                # this entity the way Get-CitrixSessionRecords does for Sessions).
-                # Adding them here but not there would make the two diverge in
-                # shape - real [datetime] on demo data, raw ISO-8601 string on a
-                # real site - a mismatch that would pass every test against demo
-                # data and only break against a real customer. If a future task
-                # needs application duration, add the fields to BOTH the live
-                # -Fields list above AND here, with a ConvertTo-UtcDateTime call
-                # on the live side to match Sessions' handling.
+                # The same fields as the live fetcher's select list, with
+                # StartDate a UTC DateTime on both sides (a test pins this).
+                # The launch is dated at the session's start, without drawing
+                # from the generator, so every other demo figure is unchanged.
                 $appInstances.Add([pscustomobject]@{
                     Id = "ai-$($s.SessionKey)-$a"
                     SessionKey = $s.SessionKey
                     ApplicationId = "app-$($rand.Next(0, $applications.Count))"
+                    StartDate = $s.StartUtc
                 })
             }
         }
@@ -3539,7 +3888,7 @@ function Test-SameReportSite {
 # "Windows security authority" rather than "Active Directory domain", which is
 # what an earlier version of this comment said. A live Citrix Cloud Government
 # site contained an account whose Domain field held a machine name
-# (JD-NDJ-W11-VD01) -- a LOCAL account on a VDA, whose SID is
+# (VDA-HOST-01) -- a LOCAL account on a VDA, whose SID is
 # S-1-5-21-<machine>-<RID> and therefore structurally identical to a domain
 # SID. Accepting it is correct: a machine's authority SID is as globally
 # unique as a domain's, so the same local account seen from two sites still
@@ -3598,6 +3947,9 @@ function Get-CanonicalSid {
     return $Sid.Trim().ToUpperInvariant()
 }
 
+$script:DerivedKeySalt = $null
+$script:DerivedKeyHmac = $null
+
 function Get-DerivedKey {
     <#
     .SYNOPSIS
@@ -3614,15 +3966,19 @@ function Get-DerivedKey {
         [Parameter(Mandatory)][byte[]] $Salt
     )
 
-    $hmac = New-Object System.Security.Cryptography.HMACSHA256 (, $Salt)
-    try {
-        $bytes = $hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes("$Label`n$Value"))
-    } finally {
-        $hmac.Dispose()
+    # One HMAC object for as long as the same salt keeps being passed. A run
+    # derives three keys for every user, and making and disposing an HMAC for
+    # each, then building the text a byte at a time through the pipeline, was
+    # most of the time an export of a large site spent on its users.
+    if (-not [object]::ReferenceEquals($script:DerivedKeySalt, $Salt)) {
+        if ($script:DerivedKeyHmac) { $script:DerivedKeyHmac.Dispose() }
+        # Recognised by being the same array, which is how a run passes its
+        # salt everywhere; nothing in this script changes a salt in place.
+        $script:DerivedKeyHmac = New-Object System.Security.Cryptography.HMACSHA256 (, $Salt)
+        $script:DerivedKeySalt = $Salt
     }
-    # 128 bits. The population is thousands of users, not billions, so
-    # collision probability here is negligible and the key stays readable.
-    return (-join ($bytes[0..15] | ForEach-Object { $_.ToString('x2') }))
+    $bytes = $script:DerivedKeyHmac.ComputeHash([Text.Encoding]::UTF8.GetBytes("$Label`n$Value"))
+    return [System.BitConverter]::ToString($bytes, 0, 16).Replace('-', '').ToLowerInvariant()
 }
 
 function Get-UserIdentityKey {
@@ -3759,7 +4115,7 @@ function Get-AmbiguousUpn {
         A UPN may bridge two identities across forests only where it
         unambiguously means one person. Measured in a live cloud tenant: four
         UPNs each mapped to two different SIDs, because two separate forests
-        shared a UPN suffix -- user1@nht39.sp existed in both, as two different
+        shared a UPN suffix -- user1@corp.example existed in both, as two different
         people. Bridging on it would merge them.
 
         The ambiguity is a property of the data, so it is computed rather than
@@ -3934,6 +4290,46 @@ function Get-SaltFileInfo {
     return $info
 }
 
+function Protect-ReportSecretFile {
+    <#
+    .SYNOPSIS
+        Makes a file this tool wrote readable by its owner (and the system
+        and administrators) only.
+    .DESCRIPTION
+        The salt is the key that turns a pseudonym back into a comparable
+        identity, and identity-map.csv is the table that turns it back into
+        a name. Both are written wherever the reports go, and a new file
+        takes its folder's permissions: on a team share, everyone with the
+        share could read them.
+
+        Best effort. A file system with no permissions (FAT, some network
+        shares) cannot be restricted; that is logged, and the run goes on,
+        because failing the report over it would help nobody.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string] $Path)
+
+    try {
+        $acl = New-Object System.Security.AccessControl.FileSecurity
+        # Protected: stop inheriting the folder's permissions, and keep none
+        # of the inherited entries.
+        $acl.SetAccessRuleProtection($true, $false)
+        $full = [System.Security.AccessControl.FileSystemRights]::FullControl
+        $allow = [System.Security.AccessControl.AccessControlType]::Allow
+        $who = @(
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+            (New-Object System.Security.Principal.SecurityIdentifier ([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null))
+            (New-Object System.Security.Principal.SecurityIdentifier ([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null))
+        )
+        foreach ($sid in $who) {
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule ($sid, $full, $allow)))
+        }
+        [System.IO.File]::SetAccessControl($Path, $acl)
+    } catch {
+        Write-ReportLog -Level Debug -Message "Could not restrict who can read $Path : $($_.Exception.Message)"
+    }
+}
+
 function Get-ReportSalt {
     <#
     .SYNOPSIS
@@ -3970,6 +4366,7 @@ function Get-ReportSalt {
         }
         Set-Content -LiteralPath $Path -Value ([Convert]::ToBase64String($salt)) `
             -Encoding ascii -ErrorAction Stop
+        Protect-ReportSecretFile -Path $Path
         $created = $true
     }
 
@@ -4735,7 +5132,42 @@ function Get-ViewUniqueUsers($View) {
     }
 }
 
-function Get-TickPeak([long[]] $Start, [long[]] $End) {
+function Get-BusinessHourSpans($WindowStartUtc, $WindowEndUtc, $TimeZone, [int] $StartHour, [int] $EndHour) {
+    # The stretches of a window that are business hours, as UTC ticks:
+    # From[i] inclusive to To[i] exclusive, in order, none touching.
+    #
+    # Found by asking Test-InBusinessHours's own question at every quarter
+    # hour of UTC, rather than by building local times and converting them:
+    # a local time can fail to exist or exist twice on the day the clocks
+    # change, and a UTC instant never does. Every time zone's offset is a
+    # whole number of quarter hours, so a local hour never begins between
+    # two of these instants and the spans are exact.
+    $quarter = [TimeSpan]::TicksPerMinute * 15
+    $ws = $WindowStartUtc.Ticks
+    $we = $WindowEndUtc.Ticks
+    $from = New-Object 'System.Collections.Generic.List[long]'
+    $to = New-Object 'System.Collections.Generic.List[long]'
+    if ($we -le $ws) { return [pscustomobject]@{ From = $from.ToArray(); To = $to.ToArray() } }
+
+    $t = $ws - ($ws % $quarter)
+    $open = [long] -1
+    while ($t -lt $we) {
+        $local = [System.TimeZoneInfo]::ConvertTimeFromUtc([datetime]::new($t, [System.DateTimeKind]::Utc), $TimeZone)
+        $in = ($local.DayOfWeek -ne [DayOfWeek]::Saturday -and $local.DayOfWeek -ne [DayOfWeek]::Sunday -and
+               $local.Hour -ge $StartHour -and $local.Hour -lt $EndHour)
+        if ($in -and $open -lt 0) {
+            $open = $t
+        } elseif (-not $in -and $open -ge 0) {
+            $from.Add([math]::Max($open, $ws)); $to.Add($t)
+            $open = [long] -1
+        }
+        $t += $quarter
+    }
+    if ($open -ge 0) { $from.Add([math]::Max($open, $ws)); $to.Add($we) }
+    [pscustomobject]@{ From = $from.ToArray(); To = $to.ToArray() }
+}
+
+function Get-TickPeak([long[]] $Start, [long[]] $End, [long[]] $SpanFrom, [long[]] $SpanTo) {
     # The sweep line of Get-PeakConcurrency, on intervals already clamped.
     #
     # Events are packed into a single long instead of an object per event:
@@ -4754,8 +5186,14 @@ function Get-TickPeak([long[]] $Start, [long[]] $End) {
     #
     # ticks * 2 cannot overflow: DateTime.MaxValue is ~3.16e18 ticks and
     # Int64.MaxValue is ~9.22e18.
+    #
+    # -SpanFrom / -SpanTo, when given, are stretches of time (see
+    # Get-BusinessHourSpans) and SpanPeak is the highest concurrency reached
+    # inside any of them, found in the same pass and just as exactly. A span
+    # counts the sessions already running as it opens and every start before
+    # it closes; a session that starts exactly as it closes is outside it.
     $n = $Start.Count
-    if ($n -eq 0) { return [pscustomobject]@{ Peak = 0; PeakAtUtc = $null } }
+    if ($n -eq 0) { return [pscustomobject]@{ Peak = 0; PeakAtUtc = $null; SpanPeak = 0 } }
 
     $keys = New-Object 'long[]' (2 * $n)
     for ($i = 0; $i -lt $n; $i++) {
@@ -4765,14 +5203,40 @@ function Get-TickPeak([long[]] $Start, [long[]] $End) {
     [Array]::Sort($keys)
 
     $current = 0; $peak = 0; $peakTicks = [long] 0
-    foreach ($key in $keys) {
-        if ($key -band 1) { $current++ } else { $current-- }
-        if ($current -gt $peak) { $peak = $current; $peakTicks = $key -shr 1 }
+    $spanPeak = 0
+    $spans = 0
+    if ($SpanFrom) { $spans = $SpanFrom.Count }
+
+    if ($spans -eq 0) {
+        foreach ($key in $keys) {
+            if ($key -band 1) { $current++ } else { $current-- }
+            if ($current -gt $peak) { $peak = $current; $peakTicks = $key -shr 1 }
+        }
+    } else {
+        $s = 0
+        # Whether the level carried into span $s has been counted yet. It is
+        # counted at the first event after the span opens, by which point
+        # every start and end AT the opening instant has been applied.
+        $entered = $false
+        foreach ($key in $keys) {
+            $t = $key -shr 1
+            while ($s -lt $spans) {
+                if (-not $entered -and $SpanFrom[$s] -lt $t) {
+                    if ($current -gt $spanPeak) { $spanPeak = $current }
+                    $entered = $true
+                }
+                if ($SpanTo[$s] -le $t) { $s++; $entered = $false; continue }
+                break
+            }
+            if ($key -band 1) { $current++ } else { $current-- }
+            if ($current -gt $peak) { $peak = $current; $peakTicks = $t }
+            if ($entered -and $current -gt $spanPeak) { $spanPeak = $current }
+        }
     }
 
     $peakAt = $null
     if ($peak -gt 0) { $peakAt = [datetime]::new($peakTicks, [System.DateTimeKind]::Utc) }
-    [pscustomobject]@{ Peak = $peak; PeakAtUtc = $peakAt }
+    [pscustomobject]@{ Peak = $peak; PeakAtUtc = $peakAt; SpanPeak = $spanPeak }
 }
 
 function Get-ViewSeries($View, [int] $IntervalMinutes) {
@@ -5279,11 +5743,19 @@ function Get-ApplicationBreakdown {
     if (-not $Dataset.ApplicationInstances -or $Dataset.ApplicationInstances.Count -eq 0) { return @() }
 
     $view = New-WindowSessionView $Dataset.Sessions $WindowStartUtc $WindowEndUtc $NowUtc
-    Get-ViewApplications $Dataset $view $Top
+    Get-ViewApplications $Dataset $view $Top $WindowStartUtc $WindowEndUtc
 }
 
-function Get-ViewApplications($Dataset, $View, [int] $Top) {
+function Get-ViewApplications($Dataset, $View, [int] $Top, $WindowStartUtc, $WindowEndUtc) {
     # Get-ApplicationBreakdown on a view.
+    #
+    # A launch is an event, so it is counted in a window only when it
+    # happened inside it. A desktop left running for two months carries
+    # every launch made in that time; before launches had their own date,
+    # all of them were counted in a 7-day window because the SESSION was in
+    # it. The user is still counted for the application: their session ran
+    # it and was open in the window. A launch with no date (data from before
+    # the date was read) is counted as it always was.
     if (-not $Dataset.ApplicationInstances -or $Dataset.ApplicationInstances.Count -eq 0) { return @() }
 
     # Only sessions inside the window contribute. IsAnonymous is carried
@@ -5292,12 +5764,15 @@ function Get-ViewApplications($Dataset, $View, [int] $Top) {
     # real launch -- while UniqueUsers, like every other unique-user count in
     # this file, excludes anonymous sessions from the named-user tally even
     # when IsAnonymous is (unusually) paired with a non-blank UserId.
+    # Session key -> the user to count, or '' for a session that names no
+    # one (anonymous, or no user). A plain string for each session, not an
+    # object: on a large site this table is built for millions of sessions,
+    # once per window.
     $sessionInfo = @{}
     foreach ($s in $View.Sessions) {
-        $sessionInfo[[string]$s.SessionKey] = [pscustomobject]@{
-            UserId      = [string]$s.UserId
-            IsAnonymous = [bool]$s.IsAnonymous
-        }
+        $who = ''
+        if (-not $s.IsAnonymous -and $s.UserId) { $who = [string] $s.UserId }
+        $sessionInfo[[string] $s.SessionKey] = $who
     }
 
     $appNames = @{}
@@ -5318,9 +5793,13 @@ function Get-ViewApplications($Dataset, $View, [int] $Top) {
             $launches[$name] = 0
             $appUsers[$name] = @{}
         }
-        $launches[$name]++
-        $info = $sessionInfo[$key]
-        if ($info.UserId -and -not $info.IsAnonymous) { $appUsers[$name][$info.UserId] = $true }
+        $when = $ai.StartDate
+        if ($when -isnot [datetime] -or $null -eq $WindowStartUtc -or
+            ($when -ge $WindowStartUtc -and $when -lt $WindowEndUtc)) {
+            $launches[$name]++
+        }
+        $who = $sessionInfo[$key]
+        if ($who) { $appUsers[$name][$who] = $true }
     }
 
     $results = foreach ($name in $launches.Keys) {
@@ -5416,7 +5895,19 @@ function Invoke-ReportAnalysis {
         [scriptblock] $ProgressAction
     )
 
-    $now = $Config.RunStartUtc
+    $generated = $Config.RunStartUtc
+    $now = $generated
+
+    # A combined report is measured back from where its exports end, not
+    # from the moment they were combined. Exports made on 1 October and
+    # combined in November describe September; measured from November, the
+    # 30-day window would hold no data at all and every session an export
+    # saw open would count as running for the weeks in between.
+    if ($Dataset.PSObject.Properties['Consolidation'] -and $Dataset.Consolidation -and
+        $Dataset.Consolidation.PSObject.Properties['AsOfUtc'] -and $Dataset.Consolidation.AsOfUtc) {
+        $now = [datetime] $Dataset.Consolidation.AsOfUtc
+    }
+
     $available = if ($Dataset.Preflight) { [int] $Dataset.Preflight.AvailableDays } else { [int]::MaxValue }
 
     # The instant from which the site's history is actually present.
@@ -5471,7 +5962,22 @@ function Invoke-ReportAnalysis {
         $partial = $null
         if ($coverage.Count -gt 0) {
             $short = @($coverage | Where-Object { $_.ContiguousStartUtc -gt $start })
+
+            # Sites whose newest export stops well before the combined period
+            # does. Their last stretch is simply missing, so the total is a
+            # lower bound for the same reason a short history makes it one.
+            # A day's grace: sites exported on the same day, hours apart, are
+            # the ordinary case and not worth a warning.
+            $early = @($coverage | Where-Object { $_.LatestEndUtc -and $_.LatestEndUtc -lt $now.AddDays(-1) })
             $partial = [pscustomobject]@{
+                EndsEarly     = $early.Count
+                EndsEarlySites = [object[]] @($early | ForEach-Object {
+                    [pscustomobject]@{
+                        EnvironmentLabel = $_.Label
+                        LatestEndUtc     = $_.LatestEndUtc
+                        MissingDays      = [int][math]::Ceiling(($now - $_.LatestEndUtc).TotalDays)
+                    }
+                })
                 ShortExports  = $short.Count
                 TotalExports  = $coverage.Count
                 Unconfirmed   = @($coverage | Where-Object { -not $_.HistoryConfirmed }).Count
@@ -5536,7 +6042,13 @@ function Invoke-ReportAnalysis {
         $users = Get-ViewUniqueUsers $view
 
         & $report 'concurrency peak' 1
-        $peak = Get-TickPeak $view.Start $view.End
+        # The business-hours peak is found in the same exact sweep as the
+        # overall one. It used to be the highest of the quarter-hour samples,
+        # which a peak at 10:07 slips between: the table then showed business
+        # hours peaking below a peak that happened in business hours.
+        $bizSpans = Get-BusinessHourSpans $effectiveStart $now $siteZone `
+            ([int] $Config.BusinessHourStart) ([int] $Config.BusinessHourEnd)
+        $peak = Get-TickPeak $view.Start $view.End $bizSpans.From $bizSpans.To
         & $report 'concurrency over time' 2
         $series = @(Get-ViewSeries $view 15)
         $windowOrdinal++
@@ -5568,7 +6080,7 @@ function Invoke-ReportAnalysis {
             P95             = Get-Percentile -Values $counts -Percentile 95
             P99             = Get-Percentile -Values $counts -Percentile 99
             BusinessP95     = Get-Percentile -Values $bizCounts -Percentile 95
-            BusinessPeak    = $(if ($bizCounts.Count) { ($bizCounts | Measure-Object -Maximum).Maximum } else { 0 })
+            BusinessPeak    = [int] $peak.SpanPeak
             # Carried on the result, not left implicit, so the report can state
             # what "business hours" actually means. A reader in another zone
             # otherwise assumes their own -- and the same figure means
@@ -5615,7 +6127,7 @@ function Invoke-ReportAnalysis {
         $applications = $null
         if ($Config.IncludeApplications) {
             Assert-NotCancelled
-            $applications = @(Get-ViewApplications $Dataset $view 20)
+            $applications = @(Get-ViewApplications $Dataset $view 20 $effectiveStart $now)
         }
 
         # Get-DailyTrend also returns a plain array and is exposed to the same
@@ -5682,7 +6194,10 @@ function Invoke-ReportAnalysis {
     }
 
     [pscustomobject]@{
-        GeneratedUtc     = $now
+        GeneratedUtc     = $generated
+        # The instant the figures run up to. The same as GeneratedUtc for a
+        # single site; for a combined report, where the newest export ends.
+        DataAsOfUtc      = $now
         Config           = $Config
         Preflight        = $Dataset.Preflight
         # Which site this is. Carried onto the analysis rather than read from
@@ -6703,6 +7218,29 @@ function Get-TimeZoneEnglishName {
     return $TimeZoneId
 }
 
+function Format-ReportPercentile {
+    <#
+    .SYNOPSIS
+        A percentile as the whole number of sessions the report states.
+    .DESCRIPTION
+        Rounded UP. The report says concurrency was "at or below" this figure
+        that share of the time, and sessions come in whole numbers, so 12.4
+        has to read 13 for the sentence to be true; rounded to the nearest it
+        read 12, and [math]::Round sent 12.5 to 12 as well (it rounds halves
+        to the even number). For a figure a licence count is sized from, the
+        error must never be on the low side.
+
+        Rounded to six places first, so a value that is a whole number but
+        for floating-point noise (12.0000000001) is not pushed up to 13.
+    .OUTPUTS
+        [int]
+    #>
+    param($Value)
+
+    if ($null -eq $Value) { return 0 }
+    return [int] [math]::Ceiling([math]::Round([double] $Value, 6))
+}
+
 function New-PartialCoverageNotice {
     <#
     .SYNOPSIS
@@ -6728,9 +7266,30 @@ function New-PartialCoverageNotice {
     if (-not $Window.PSObject.Properties['PartialCoverage']) { return '' }
     $pc = $Window.PartialCoverage
     if (-not $pc) { return '' }
-    if ([int]$pc.ShortExports -le 0 -and [int]$pc.Unconfirmed -le 0) { return '' }
+    $endsEarly = 0
+    if ($pc.PSObject.Properties['EndsEarly']) { $endsEarly = [int] $pc.EndsEarly }
+    if ([int]$pc.ShortExports -le 0 -and [int]$pc.Unconfirmed -le 0 -and $endsEarly -le 0) { return '' }
 
     $parts = New-Object System.Collections.Generic.List[string]
+
+    if ($endsEarly -gt 0) {
+        $rows = (@($pc.EndsEarlySites) | ForEach-Object {
+            "<li>{0} &mdash; newest export ends {1}, {2} day(s) before the end of this report's period</li>" -f `
+                (ConvertTo-HtmlEncoded -Text ([string]$_.EnvironmentLabel)),
+                ([datetime]$_.LatestEndUtc).ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture),
+                [int]$_.MissingDays
+        }) -join "`n"
+        $parts.Add(@"
+  <strong>$endsEarly of $([int]$pc.TotalExports) sites have no data for the
+  last part of this $($Window.Days)-day window.</strong>
+  Those sites are counted only up to their newest export, so this total is a
+  <strong>lower bound</strong>. Export those sites again and combine again
+  for a complete figure.
+  <ul>
+$rows
+  </ul>
+"@)
+    }
 
     if ([int]$pc.ShortExports -gt 0) {
         $rows = (@($pc.ShortSites) | ForEach-Object {
@@ -6944,8 +7503,8 @@ function New-WindowSection {
     </div>
     <div class="kpi">
       <div class="label">95th percentile concurrent sessions</div>
-      <div class="value">$([math]::Round($c.P95, 0))</div>
-      <div class="note">Business hours ($bizLabel): $([math]::Round($c.BusinessP95, 0))</div>$lowerBound
+      <div class="value">$(Format-ReportPercentile $c.P95)</div>
+      <div class="note">Business hours ($bizLabel): $(Format-ReportPercentile $c.BusinessP95)</div>$lowerBound
     </div>
     <div class="kpi">
       <div class="label">Total sessions</div>
@@ -6969,10 +7528,10 @@ function New-WindowSection {
   <table>
     <thead><tr><th>Concurrent sessions were&hellip;</th><th class="num">All hours</th><th class="num">Business hours<br><span class="footnote">$bizLabel</span></th></tr></thead>
     <tbody>
-      <tr><td>Half the time, at or below</td><td class="num">$([math]::Round($c.P50,0))</td><td class="num">&mdash;</td></tr>
-      <tr><td>9 times out of 10, at or below</td><td class="num">$([math]::Round($c.P90,0))</td><td class="num">&mdash;</td></tr>
-      <tr><td>19 times out of 20, at or below</td><td class="num">$([math]::Round($c.P95,0))</td><td class="num">$([math]::Round($c.BusinessP95,0))</td></tr>
-      <tr><td>99 times out of 100, at or below</td><td class="num">$([math]::Round($c.P99,0))</td><td class="num">&mdash;</td></tr>
+      <tr><td>Half the time, at or below</td><td class="num">$(Format-ReportPercentile $c.P50)</td><td class="num">&mdash;</td></tr>
+      <tr><td>9 times out of 10, at or below</td><td class="num">$(Format-ReportPercentile $c.P90)</td><td class="num">&mdash;</td></tr>
+      <tr><td>19 times out of 20, at or below</td><td class="num">$(Format-ReportPercentile $c.P95)</td><td class="num">$(Format-ReportPercentile $c.BusinessP95)</td></tr>
+      <tr><td>99 times out of 100, at or below</td><td class="num">$(Format-ReportPercentile $c.P99)</td><td class="num">&mdash;</td></tr>
       <tr><td>Highest at any single moment</td><td class="num">$($c.Peak)</td><td class="num">$($c.BusinessPeak)</td></tr>
     </tbody>
   </table>
@@ -7024,6 +7583,7 @@ function New-WindowSection {
     <tbody>$appRows</tbody>
   </table>
   </div>
+  <p class="footnote">Launches are those started in this period. Unique users are the people whose session ran the application and was open in this period.</p>
 </div>
 "@)
     }
@@ -7270,7 +7830,7 @@ $items
     $gapHtml = ''
     if (@($Consolidation.CoverageGaps).Count -gt 0) {
         $gapItems = (@($Consolidation.CoverageGaps) | ForEach-Object {
-            '    <li>{0:yyyy-MM-dd} to {1:yyyy-MM-dd}</li>' -f $_.FromUtc, $_.ToUtc
+            [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '    <li>{0:yyyy-MM-dd} to {1:yyyy-MM-dd}</li>', $_.FromUtc, $_.ToUtc)
         }) -join "`n"
         $gapHtml = @"
 
@@ -7514,6 +8074,14 @@ function New-HtmlReport {
         ('      <tr><td>Machines</td><td>{0}</td></tr>' -f $Analysis.SiteTotals.Machines)
     }
 
+    # A combined report's windows end where its newest export ends, which can
+    # be weeks before the day it was combined. Said outright, so nobody reads
+    # "30 days" as the 30 days before the report's own date.
+    $dataAsOfRow = ''
+    if ($isConsolidated -and $Analysis.PSObject.Properties['DataAsOfUtc'] -and $Analysis.DataAsOfUtc) {
+        $dataAsOfRow = "`n      <tr><td>Data runs up to</td><td>$(Format-LocalTime -Utc $Analysis.DataAsOfUtc -TimeZoneId $tz) (the end of the newest export; every period is counted back from here)</td></tr>"
+    }
+
     @"
 <!DOCTYPE html>
 <html lang="en">
@@ -7545,7 +8113,7 @@ $retentionBanner
   <table>
     <tbody>
       <tr><td>Environment</td><td>$(ConvertTo-HtmlEncoded -Text $cfg.EnvironmentLabel)</td></tr>
-      <tr><td>Report generated</td><td>$(Format-LocalTime -Utc $Analysis.GeneratedUtc -TimeZoneId $tz)</td></tr>
+      <tr><td>Report generated</td><td>$(Format-LocalTime -Utc $Analysis.GeneratedUtc -TimeZoneId $tz)</td></tr>$dataAsOfRow
       <tr><td>Session history retained</td><td>$retentionCell</td></tr>
 $inventoryRows
     </tbody>
@@ -7789,9 +8357,9 @@ function New-IdentityMapRows {
             Pseudonym  = $Map[$id]
             UserKey    = $userKey
             RealUserId = $id
-            UserName   = $(if ($u) { [string] $u.UserName } else { '' })
-            FullName   = $(if ($u) { [string] $u.FullName } else { '' })
-            Upn        = $(if ($u) { [string] $u.Upn } else { '' })
+            UserName   = $(if ($u) { ConvertTo-CsvSafeText ([string] $u.UserName) } else { '' })
+            FullName   = $(if ($u) { ConvertTo-CsvSafeText ([string] $u.FullName) } else { '' })
+            Upn        = $(if ($u) { ConvertTo-CsvSafeText ([string] $u.Upn) } else { '' })
         }
     }
 
@@ -7919,7 +8487,67 @@ function ConvertTo-AnonymizedDataset {
     $copy.Users = @($users)
     $copy.Sessions = @($sessions)
     $copy.Connections = @($connections)
+
+    # A combined report built from exports that were NOT anonymized carries
+    # real identifiers in one more place: the list of name matches, whose
+    # key is the user principal name itself and whose members are security
+    # identifiers. The report prints that list, so an anonymized combined
+    # report named people after all. Each match is relabelled with the
+    # pseudonym of the person it produced. Exports that were anonymized
+    # carry only derived keys there and are left alone.
+    #
+    # IdentityRows is deliberately not touched. It feeds
+    # consolidated-identity-map.csv, which exists to be joined against each
+    # site's identity-map.csv and is useless once masked; that file is a
+    # decode key and is kept, not sent (99-Main.ps1 says so when writing it).
+    if ($Dataset.PSObject.Properties['Consolidation'] -and $Dataset.Consolidation -and
+        @($Dataset.Consolidation.Inputs | Where-Object { -not [bool] $_.Anonymized }).Count -gt 0) {
+
+        $personOf = @{}
+        foreach ($r in @($Dataset.Consolidation.IdentityRows)) {
+            $personOf[[string] $r.UserKey] = [string] $r.ConsolidatedKey
+        }
+
+        $bridges = foreach ($b in @($Dataset.Consolidation.Bridges)) {
+            $label = 'A name match'
+            foreach ($k in @($b.UserKeys)) {
+                $person = $personOf[[string] $k]
+                if ($person -and $Map.ContainsKey($person)) { $label = [string] $Map[$person]; break }
+            }
+            [pscustomobject]@{
+                BridgeKey  = $label
+                # The same number of members, so the counts the report prints
+                # are unchanged; none of them an identifier.
+                UserKeys   = [object[]] @(@($b.UserKeys) | ForEach-Object { 'account' })
+                ForestKeys = [object[]] @(@($b.ForestKeys) | ForEach-Object { 'directory' })
+                IsSuspect  = [bool] $b.IsSuspect
+            }
+        }
+
+        $consolidation = $Dataset.Consolidation.PSObject.Copy()
+        $consolidation.Bridges = [object[]] @($bridges)
+        $copy.Consolidation = $consolidation
+    }
+
     return $copy
+}
+
+function ConvertTo-ReportDecimalText {
+    <#
+    .SYNOPSIS
+        A figure to one decimal place, written the same on every machine.
+    .DESCRIPTION
+        A full stop for the decimal point and no thousands separator,
+        whatever the machine's language. Halves round away from zero, the
+        way a person rounds, not to the even digit.
+    .OUTPUTS
+        [string]
+    #>
+    param($Value)
+
+    if ($null -eq $Value) { return '' }
+    return [math]::Round([double] $Value, 1, [System.MidpointRounding]::AwayFromZero).ToString(
+        '0.0', [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
 function ConvertTo-ReportRoundTripUtcText {
@@ -7976,14 +8604,26 @@ function Write-SessionsCsv {
 
     $fmt = 'yyyy-MM-ddTHH:mm:ssZ'
     $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $lead = $script:CsvFormulaLead
     $writer = New-Object System.IO.StreamWriter($Path, $false, (New-Object System.Text.UTF8Encoding($true)))
     try {
         $writer.WriteLine('"SessionKey","UserId","MachineId","StartUtc","EndUtc","SessionType","IsAnonymous"')
         foreach ($s in $Sessions) {
             # Export-Csv writes a null field as nothing at all, not as "".
             $key = ''; $user = ''; $machine = ''; $type = ''; $anon = ''
-            if ($null -ne $s.SessionKey)  { $key = '"' + ([string] $s.SessionKey).Replace('"', '""') + '"' }
-            if ($null -ne $s.UserId)      { $user = '"' + ([string] $s.UserId).Replace('"', '""') + '"' }
+            # The key and the user can come from another party's file in a
+            # combined run; see ConvertTo-CsvSafeText, inlined here because
+            # this runs once per session.
+            if ($null -ne $s.SessionKey) {
+                $text = [string] $s.SessionKey
+                if ($text.Length -gt 0 -and $lead.IndexOf($text[0]) -ge 0) { $text = "'" + $text }
+                $key = '"' + $text.Replace('"', '""') + '"'
+            }
+            if ($null -ne $s.UserId) {
+                $text = [string] $s.UserId
+                if ($text.Length -gt 0 -and $lead.IndexOf($text[0]) -ge 0) { $text = "'" + $text }
+                $user = '"' + $text.Replace('"', '""') + '"'
+            }
             if ($null -ne $s.MachineId)   { $machine = '"' + ([string] $s.MachineId).Replace('"', '""') + '"' }
             if ($null -ne $s.SessionType) { $type = '"' + ([string] $s.SessionType).Replace('"', '""') + '"' }
             if ($null -ne $s.IsAnonymous) { $anon = '"' + ([string] $s.IsAnonymous) + '"' }
@@ -8065,6 +8705,9 @@ function Export-ReportData {
     # The full analysis, minus the config (which holds credential objects).
     $exportable = [pscustomobject]@{
         GeneratedUtc = $Analysis.GeneratedUtc
+        # Where the figures run up to. Differs from GeneratedUtc only for a
+        # combined report, whose windows end at its newest export.
+        DataAsOfUtc  = $(if ($Analysis.PSObject.Properties['DataAsOfUtc'] -and $Analysis.DataAsOfUtc) { $Analysis.DataAsOfUtc } else { $Analysis.GeneratedUtc })
         Environment  = $Analysis.Config.EnvironmentLabel
         IsDemo       = $Analysis.IsDemo
         Preflight    = $Analysis.Preflight
@@ -8079,7 +8722,12 @@ function Export-ReportData {
         Windows      = @($windows | ForEach-Object {
             [pscustomobject]@{
                 Days = $_.Days; WindowStartUtc = $_.WindowStartUtc; WindowEndUtc = $_.WindowEndUtc
-                IsTruncated = $_.IsTruncated; UniqueUsers = $_.UniqueUsers
+                IsTruncated = $_.IsTruncated
+                # Null for a single site. For a combined report, which sites
+                # do not span this window -- the reason its total is a lower
+                # bound, which the HTML said and this file did not.
+                PartialCoverage = $_.PartialCoverage
+                UniqueUsers = $_.UniqueUsers
                 AnonymousSessions = $_.AnonymousSessions
                 # UnattributedSessions (sessions with a blank UserId that are
                 # not flagged IsAnonymous) is carried through here so the
@@ -8152,12 +8800,25 @@ function Export-ReportData {
                 UnattributedSessions    = $_.UnattributedSessions
                 TotalSessions           = $_.TotalSessions
                 PeakConcurrent          = $_.Concurrency.Peak
-                P95Concurrent           = [math]::Round($_.Concurrency.P95, 1)
-                BusinessHoursP95        = [math]::Round($_.Concurrency.BusinessP95, 1)
+                # Written as text with a full stop, whatever the machine's
+                # language: Export-Csv writes a number the machine's way, so
+                # a German machine wrote "12,5" and a reader elsewhere took
+                # it for 125 or for two columns.
+                P95Concurrent           = ConvertTo-ReportDecimalText $_.Concurrency.P95
+                BusinessHoursP95        = ConvertTo-ReportDecimalText $_.Concurrency.BusinessP95
                 BusinessHoursDefinition  = '{0:00}:00-{1:00}:00 Mon-Fri {2}' -f `
                     [int] $_.Concurrency.BusinessHourStart, [int] $_.Concurrency.BusinessHourEnd,
                     $_.Concurrency.BusinessTimeZoneId
                 SessionsIncomplete      = $sessionsIncomplete
+                # A combined report only: true when some site's exports do
+                # not span this window, which also makes the row a lower
+                # bound. Empty for a single site.
+                PartialCoverage         = $(if ($_.PartialCoverage) {
+                    [bool] (([int] $_.PartialCoverage.ShortExports -gt 0) -or
+                            ($_.PartialCoverage.PSObject.Properties['EndsEarly'] -and [int] $_.PartialCoverage.EndsEarly -gt 0))
+                } else { $null })
+                WindowStartUtc          = ConvertTo-ReportRoundTripUtcText $_.WindowStartUtc
+                WindowEndUtc            = ConvertTo-ReportRoundTripUtcText $_.WindowEndUtc
             }
         }) | Export-Csv -Path $summaryPath -NoTypeInformation -Encoding UTF8
         [void] $written.Add($summaryPath)
@@ -8206,6 +8867,7 @@ function Export-ReportData {
             $rows = @(New-IdentityMapRows -Map $Map -Users @())
         }
         $rows | Export-Csv -Path $mapPath -NoTypeInformation -Encoding UTF8
+        Protect-ReportSecretFile -Path $mapPath
         [void] $written.Add($mapPath)
         Write-ReportLog -Level Warn -Message "Identity map written to $mapPath. Keep this file. Do not send it with the report."
     }
@@ -8307,6 +8969,17 @@ function ConvertFrom-MergeExportUtc {
     return [datetime]::SpecifyKind($parsed, [System.DateTimeKind]::Utc)
 }
 
+$script:MergeJsonPlainText = New-Object System.Text.RegularExpressions.Regex '^[A-Za-z0-9 _.:@{}\-]*$'
+
+function ConvertTo-MergeJsonString($Value) {
+    # One value as JSON text: null, or a quoted and escaped string. Plain
+    # (no CmdletBinding) because it runs for every key of every user.
+    if ($null -eq $Value) { return 'null' }
+    $s = [string] $Value
+    if ($script:MergeJsonPlainText.IsMatch($s)) { return '"' + $s + '"' }
+    return [System.Web.HttpUtility]::JavaScriptStringEncode($s, $true)
+}
+
 function Export-MergeData {
     <#
     .SYNOPSIS
@@ -8399,21 +9072,20 @@ function Export-MergeData {
         $users.Add([pscustomobject]$entry)
     }
 
-    $sessions = New-Object System.Collections.Generic.List[object]
-    foreach ($s in @($Dataset.Sessions)) {
-        if (-not $s) { continue }
+    # Accounts whose sessions leave here with no user key: the account has
+    # no directory security identifier (or was not in the Users list at
+    # all), so there is nothing to match it on across sites. This site's own
+    # report counts each as a user; a combined report cannot, and has to say
+    # so rather than quietly come out lower.
+    $unkeyedUsers = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $unkeyedSessions = 0
 
-        $localId = [string]$s.UserId
-        $userKey = $null
-        if ($localId -and $keyByLocalId.ContainsKey($localId)) { $userKey = $keyByLocalId[$localId] }
-
-        $sessions.Add([pscustomobject][ordered]@{
-            sessionKey  = [string]$s.SessionKey
-            userKey     = $userKey
-            startUtc    = ConvertTo-MergeUtcText -Utc $s.StartUtc
-            endUtc      = ConvertTo-MergeUtcText -Utc $s.EndUtc
-            isAnonymous = [bool]$s.IsAnonymous
-        })
+    # Each user's key as it will appear in the file, worked out once so the
+    # session loop below only looks it up.
+    $keyJsonByLocalId = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    Add-Type -AssemblyName System.Web
+    foreach ($id in @($keyByLocalId.Keys)) {
+        $keyJsonByLocalId[[string] $id] = ConvertTo-MergeJsonString $keyByLocalId[$id]
     }
 
     $site = $Dataset.SiteIdentity
@@ -8469,25 +9141,26 @@ function Export-MergeData {
         # .ToArray(); only the @() form is broken. [object[]] is explicit so a
         # single-element result still renders as a JSON array rather than
         # collapsing to a bare object.
-        users    = [object[]] $users.ToArray()
-        sessions = [object[]] $sessions.ToArray()
     }
 
     # Said in the export itself, or a site whose sessions were not all read
     # would be consolidated into totals that carry no warning at all. Added
-    # only when true, so a complete export is byte-identical to one from
-    # before this existed, and older readers ignore it.
+    # only when true, so older readers, which ignore them, see nothing new.
     $fetchWarnings = @()
     if ($Dataset.PSObject.Properties['FetchWarnings']) { $fetchWarnings = @($Dataset.FetchWarnings) }
-    if (Test-SessionFetchIncomplete -Warnings $fetchWarnings) {
-        $payload['sessionsIncomplete'] = $true
-    }
+    $sessionsIncomplete = Test-SessionFetchIncomplete -Warnings $fetchWarnings
+    $usersIncomplete = @($fetchWarnings | Where-Object { $_ -and $_.PSObject.Properties['Entity'] -and $_.Entity -eq 'Users' }).Count -gt 0
 
-    # -Compress: indented, Windows PowerShell 5.1 writes about 385
-    # characters a session, so a 90-day export from a site with a few
-    # million sessions approaches the largest string .NET can hold. Compact
-    # it is half that, and about four times faster to write.
-    $json = $payload | ConvertTo-Json -Depth 8 -Compress
+    # The file is written as it is worked out, a session at a time. It used
+    # to be built whole in memory -- an object for every session, then one
+    # string holding the entire file -- and handed to ConvertTo-Json, which
+    # on Windows PowerShell 5.1 took about 25 minutes for 1.5 million
+    # sessions and approached the largest string .NET can hold.
+    #
+    # The head (everything but the two lists) still goes through
+    # ConvertTo-Json; its closing brace is taken off and the lists follow.
+    $head = ($payload | ConvertTo-Json -Depth 8 -Compress)
+    $head = $head.Substring(0, $head.LastIndexOf('}'))
 
     # No BOM: RFC 8259 forbids it and Python and JavaScript parsers reject it.
     # The same defect was found and fixed once already in data.json, so it is
@@ -8496,9 +9169,99 @@ function Export-MergeData {
     if ($dir -and -not (Test-Path -LiteralPath $dir)) {
         New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null
     }
-    [IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
+    # Written beside the target and moved into place when complete, so a run
+    # that stops part-way never leaves half a file under the real name.
+    $partial = "$Path.partial"
+    $sessionCount = 0
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    $plain = $script:MergeJsonPlainText
+    $writer = New-Object System.IO.StreamWriter ($partial, $false, (New-Object System.Text.UTF8Encoding($false)), 1048576)
+    try {
+        $writer.Write($head)
+        $writer.Write(',"users":[')
+        $first = $true
+        foreach ($u in $users) {
+            if (-not $first) { $writer.Write(',') }
+            $first = $false
+            $writer.Write('{"userKey":'); $writer.Write((ConvertTo-MergeJsonString $u.userKey))
+            $writer.Write(',"forestKey":'); $writer.Write((ConvertTo-MergeJsonString $u.forestKey))
+            $writer.Write(',"bridgeKey":'); $writer.Write((ConvertTo-MergeJsonString $u.bridgeKey))
+            $writer.Write(',"upnAmbiguousInSite":'); $writer.Write($(if ($u.upnAmbiguousInSite) { 'true' } else { 'false' }))
+            if ($u.PSObject.Properties['linkKey']) {
+                $writer.Write(',"linkKey":'); $writer.Write((ConvertTo-MergeJsonString $u.linkKey))
+            }
+            $writer.Write('}')
+        }
 
-    Write-ReportLog -Level Success -Message "Merge export written to $Path ($($users.Count) user(s), $($sessions.Count) session(s))."
+        $writer.Write('],"sessions":[')
+        $first = $true
+        $cancelTick = 0
+        foreach ($s in $Dataset.Sessions) {
+            if (-not $s) { continue }
+            if ((++$cancelTick -band 0x3FFF) -eq 0 -and $script:ReportCancellationSource -and
+                $script:ReportCancellationSource.IsCancellationRequested) {
+                throw (New-Object System.OperationCanceledException 'The run was canceled.')
+            }
+
+            $localId = [string] $s.UserId
+            $keyJson = 'null'
+            $known = $false
+            if ($localId) { $known = $keyJsonByLocalId.TryGetValue($localId, [ref] $keyJson) }
+            if (-not $known) {
+                $keyJson = 'null'
+                if (-not [bool] $s.IsAnonymous -and -not [string]::IsNullOrWhiteSpace($localId)) {
+                    [void] $unkeyedUsers.Add($localId)
+                    $unkeyedSessions++
+                }
+            }
+
+            $sessionKey = [string] $s.SessionKey
+            if ($plain.IsMatch($sessionKey)) { $sessionKey = '"' + $sessionKey + '"' }
+            else { $sessionKey = [System.Web.HttpUtility]::JavaScriptStringEncode($sessionKey, $true) }
+
+            # ConvertTo-MergeUtcText, written out: twice per session.
+            $startText = 'null'
+            if ($null -ne $s.StartUtc) {
+                $startText = '"' + ([datetime] $s.StartUtc).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', $invariant) + '"'
+            }
+            $endText = 'null'
+            if ($null -ne $s.EndUtc) {
+                $endText = '"' + ([datetime] $s.EndUtc).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', $invariant) + '"'
+            }
+
+            if ($first) { $first = $false } else { $writer.Write(',') }
+            $writer.Write('{"sessionKey":'); $writer.Write($sessionKey)
+            $writer.Write(',"userKey":'); $writer.Write($keyJson)
+            $writer.Write(',"startUtc":'); $writer.Write($startText)
+            $writer.Write(',"endUtc":'); $writer.Write($endText)
+            if ([bool] $s.IsAnonymous) { $writer.Write(',"isAnonymous":true}') } else { $writer.Write(',"isAnonymous":false}') }
+            $sessionCount++
+        }
+        $writer.Write(']')
+
+        if ($sessionsIncomplete) { $writer.Write(',"sessionsIncomplete":true') }
+        # Written only when there is something to say, like sessionsIncomplete,
+        # so an ordinary export carries nothing new.
+        if ($unkeyedUsers.Count -gt 0) {
+            $writer.Write(',"unkeyedUsers":' + $unkeyedUsers.Count.ToString($invariant))
+            $writer.Write(',"unkeyedSessions":' + $unkeyedSessions.ToString($invariant))
+        }
+        if ($usersIncomplete) { $writer.Write(',"usersIncomplete":true') }
+        $writer.Write('}')
+    } catch {
+        $writer.Dispose(); $writer = $null
+        Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
+        throw
+    } finally {
+        if ($writer) { $writer.Dispose() }
+    }
+    if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop }
+    [System.IO.File]::Move($partial, $Path)
+
+    Write-ReportLog -Level Success -Message "Merge export written to $Path ($($users.Count) user(s), $sessionCount session(s))."
+    if ($unkeyedUsers.Count -gt 0) {
+        Write-ReportLog -Level Warn -Message "$($unkeyedUsers.Count) account(s) with $unkeyedSessions session(s) have no directory security identifier, so they cannot be matched across sites. This site's own report counts them as users; a combined report will count their sessions but not them, and will say so."
+    }
     if ($ambiguous.Count -gt 0) {
         Write-ReportLog -Level Warn -Message "$($ambiguous.Count) UPN(s) in this site map to more than one account and are excluded from cross-forest matching. Those users can still be matched by SID."
     }
@@ -8573,7 +9336,13 @@ function Import-MergeExport {
         return $result
     }
 
-    $schema = [int] $json.schemaVersion
+    # Inside a try like everything else here: a file whose schemaVersion is
+    # not a number must cost only itself, not the whole combine.
+    $schema = 0
+    try { $schema = [int] $json.schemaVersion } catch {
+        $result.Error = "$Path has a schemaVersion that is not a number and cannot be consolidated."
+        return $result
+    }
     if ($script:SupportedMergeSchemas -notcontains $schema) {
         $result.Error = "$Path uses merge schema $schema, which this version does not understand (it understands $($script:SupportedMergeSchemas -join ', ')). Use a newer build to read it."
         return $result
@@ -8582,6 +9351,18 @@ function Import-MergeExport {
     foreach ($required in 'users', 'sessions', 'site', 'windowStartUtc', 'windowEndUtc') {
         if (-not $json.PSObject.Properties[$required]) {
             $result.Error = "$Path is missing the '$required' field and cannot be consolidated."
+            return $result
+        }
+    }
+
+    # The window is what every figure is measured against. A file whose
+    # window cannot be read is rejected here, by name, rather than stopping
+    # the whole combine later with an error that names no file.
+    foreach ($field in 'windowStartUtc', 'windowEndUtc') {
+        try {
+            if ($null -eq (ConvertFrom-MergeExportUtc $json.$field)) { throw 'it is empty' }
+        } catch {
+            $result.Error = "$Path has a '$field' that is not a date and cannot be consolidated."
             return $result
         }
     }
@@ -8971,6 +9752,10 @@ function Merge-ConsolidatedSessions {
         exports whose windows overlap be unioned without counting a session
         twice, and it is why the temporal workflow needs no extra bookkeeping.
 
+        Of two copies of one session, the one that records its end is kept;
+        see the comments in the body for why, and for how a session that was
+        still open when its export was made is bounded.
+
         The user key is rewritten through the consolidated map, so two bridged
         forest accounts reach the analytics as one person. Without that, the
         unique-user count would quietly undo the merge.
@@ -8984,22 +9769,27 @@ function Merge-ConsolidatedSessions {
         [Parameter(Mandatory)][hashtable] $KeyMap
     )
 
-    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    # Where each export's own data stops, and where the newest one does. An
+    # export describes its site up to its windowEndUtc and no further: a
+    # session it recorded as still open was open THEN. Nothing here knows
+    # what it did afterwards.
+    $usable = @(@($Imports) | Where-Object { $_ -and -not $_.Error })
+    $asOf = Get-ConsolidatedAsOfUtc -Imports $usable
+
+    # Session key -> its position in $out, so a later sighting of the same
+    # session can replace the earlier one in place.
+    $index = New-Object 'System.Collections.Generic.Dictionary[string,int]'
+    $observed = New-Object 'System.Collections.Generic.List[datetime]'
     $out = New-Object System.Collections.Generic.List[object]
 
-    foreach ($i in @($Imports)) {
-        if (-not $i -or $i.Error) { continue }
+    foreach ($i in $usable) {
+        $exportEnd = ConvertFrom-MergeExportUtc $i.Export.windowEndUtc
+        if ($null -eq $exportEnd) { $exportEnd = $asOf }
+
         foreach ($s in @($i.Export.sessions)) {
             if (-not $s) { continue }
             $key = [string]$s.sessionKey
             if ([string]::IsNullOrWhiteSpace($key)) { continue }
-            if (-not $seen.Add($key)) { continue }
-
-            $userKey = [string]$s.userKey
-            $mapped = $null
-            if (-not [string]::IsNullOrWhiteSpace($userKey)) {
-                $mapped = $(if ($KeyMap.ContainsKey($userKey)) { $KeyMap[$userKey] } else { $userKey })
-            }
 
             # Parsed to real DateTimes: the analytics does arithmetic on
             # these, and a string would compare lexicographically instead,
@@ -9013,18 +9803,92 @@ function Merge-ConsolidatedSessions {
                 $end = ConvertFrom-MergeExportUtc $s.endUtc
             }
 
-            $out.Add([pscustomobject]@{
-                SessionKey  = $key
-                UserId      = $mapped
-                StartUtc    = $start
-                EndUtc      = $end
-                IsAnonymous = [bool]$s.isAnonymous
-                MachineId   = $null
-            })
+            # The same session in two exports of one site, which is what
+            # exporting on a schedule produces. The copies differ in exactly
+            # one way that matters: the older export saw it open, the newer
+            # one saw it end. Keeping whichever file happened to be read
+            # first left such a session open for good, so the copy that
+            # knows the end wins, and between two that agree the newer
+            # export's does.
+            $slot = 0
+            $known = $index.TryGetValue($key, [ref] $slot)
+            if ($known) {
+                $kept = $out[$slot]
+                $keptOpen = $kept.OpenAtExport
+                $newOpen = ($null -eq $end)
+                if ($keptOpen -eq $newOpen) {
+                    if ($exportEnd -le $observed[$slot]) { continue }
+                } elseif ($newOpen) {
+                    continue
+                }
+            }
+
+            # A session still open when its export was made is counted up to
+            # that export's end and no further. Left open, it would run on
+            # to the end of the combined period -- for a site exported weeks
+            # before the newest one, weeks of concurrency that nobody
+            # observed. The newest export's open sessions stay open: its end
+            # IS the end of the combined period.
+            $openAtExport = ($null -eq $end)
+            if ($openAtExport -and $exportEnd -lt $asOf) { $end = $exportEnd }
+
+            $userKey = [string]$s.userKey
+            $mapped = $null
+            if (-not [string]::IsNullOrWhiteSpace($userKey)) {
+                $mapped = $(if ($KeyMap.ContainsKey($userKey)) { $KeyMap[$userKey] } else { $userKey })
+            }
+
+            $record = [pscustomobject]@{
+                SessionKey   = $key
+                UserId       = $mapped
+                StartUtc     = $start
+                EndUtc       = $end
+                IsAnonymous  = [bool]$s.isAnonymous
+                MachineId    = $null
+                # True when the export that supplied this copy saw the
+                # session still running. EndUtc is then that export's end
+                # (or null for the newest export), not an observed logoff.
+                OpenAtExport = $openAtExport
+            }
+
+            if ($known) {
+                $out[$slot] = $record
+                $observed[$slot] = $exportEnd
+            } else {
+                $index[$key] = $out.Count
+                $out.Add($record)
+                $observed.Add($exportEnd)
+            }
         }
     }
 
     return $out.ToArray()
+}
+
+function Get-ConsolidatedAsOfUtc {
+    <#
+    .SYNOPSIS
+        The instant a set of exports describes their sites up to: the latest
+        of their window ends.
+    .DESCRIPTION
+        A combined report is about the period the exports cover, not about
+        the day somebody combined them. Measuring to the moment of combining
+        added a stretch with no data in it to every window, and counted every
+        session an export had seen open as running through that stretch.
+    .OUTPUTS
+        [datetime] of kind Utc, or the current time when no export has a
+        readable end.
+    #>
+    param([AllowEmptyCollection()] $Imports)
+
+    $latest = $null
+    foreach ($i in @($Imports)) {
+        if (-not $i -or $i.Error -or -not $i.Export) { continue }
+        $end = ConvertFrom-MergeExportUtc $i.Export.windowEndUtc
+        if ($null -ne $end -and ($null -eq $latest -or $end -gt $latest)) { $latest = $end }
+    }
+    if ($null -eq $latest) { return [datetime]::UtcNow }
+    return $latest
 }
 
 function Get-ConsolidatedSiteCoverage {
@@ -9276,6 +10140,35 @@ function New-ConsolidatedDataset {
         }
     })
 
+    # Accounts a site could not give a cross-site key. Their sessions are in
+    # every concurrency figure, but they are in no unique-user total, so that
+    # total is low by up to their number. Raised against Users, not Sessions:
+    # the concurrency figures are complete.
+    $fetchWarnings += @($imports | Where-Object {
+        $_.Export.PSObject.Properties['unkeyedUsers'] -and [int] $_.Export.unkeyedUsers -gt 0
+    } | ForEach-Object {
+        $label = [string] $_.Export.site.environmentLabel
+        if ([string]::IsNullOrWhiteSpace($label)) { $label = 'one site' }
+        [pscustomobject]@{
+            Entity      = 'Users'
+            Reason      = 'SiteUnkeyedUsers'
+            RecordCount = [int] $_.Export.unkeyedUsers
+            Message     = "$([int] $_.Export.unkeyedUsers) account(s) in the export from $label have no directory security identifier, so they could not be matched across sites. Their sessions are counted in every concurrency figure, but they are not in the unique-user totals, which are low by up to that many."
+        }
+    })
+    $fetchWarnings += @($imports | Where-Object {
+        $_.Export.PSObject.Properties['usersIncomplete'] -and $_.Export.usersIncomplete
+    } | ForEach-Object {
+        $label = [string] $_.Export.site.environmentLabel
+        if ([string]::IsNullOrWhiteSpace($label)) { $label = 'one site' }
+        [pscustomobject]@{
+            Entity      = 'Users'
+            Reason      = 'SiteUsersIncomplete'
+            RecordCount = @($_.Export.users).Count
+            Message     = "Not every user record was read when the export from $label was made, so some of its sessions carry no user. The unique-user totals are a lower bound. Run that site's export again."
+        }
+    })
+
     [pscustomobject]@{
         Sessions             = $sessions
         Users                = $users
@@ -9330,6 +10223,9 @@ function New-ConsolidatedDataset {
             # exports fall short of a window, the second to decide whether any
             # of them do.
             Coverage          = [object[]] $coverage
+            # The latest instant any export describes. The analysis measures
+            # every window back from here, not from the moment of combining.
+            AsOfUtc           = $latest
             # Per SITE, which is the granularity the report must judge by.
             SiteCoverage      = [object[]] @(Get-ConsolidatedSiteCoverage -Coverage $coverage)
             FullCoverageStartUtc = $fullCoverageStart
@@ -9381,7 +10277,10 @@ function Get-ConsolidatedDatasetFromPaths {
         # A customer identity mapping to apply while combining. Only its
         # exact-UPN rows can be: see ConvertTo-CombineTimeMapping.
         [AllowNull()][string] $IdentityMapPath,
-        [Parameter(Mandatory)][string] $DefaultSaltDirectory
+        [Parameter(Mandatory)][string] $DefaultSaltDirectory,
+        # The run is anonymized, so nothing it writes may name a person. The
+        # run log is one of the files sent back.
+        [switch] $HideIdentifiers
     )
 
     $files = New-Object System.Collections.Generic.List[string]
@@ -9495,11 +10394,19 @@ function Get-ConsolidatedDatasetFromPaths {
     }
 
     foreach ($b in @($identity.Bridges | Where-Object { $_.IsSuspect })) {
+        # From exports that were not anonymized the key IS the user
+        # principal name. An anonymized run does not write it to the log;
+        # consolidated-identity-map.csv, which stays with the operator,
+        # shows which accounts were joined.
+        if ($HideIdentifiers -and -not [bool] $validation.Anonymized) {
+            Write-ReportLog -Level Warn -Message "A name match joined $(@($b.UserKeys).Count) account(s) across $(@($b.ForestKeys).Count) directories. One person with that many accounts is possible, and so is a name collision. The rows marked UpnBridge in consolidated-identity-map.csv show which; verify it, or exclude it with -ExcludeBridgeUpn."
+            continue
+        }
         Write-ReportLog -Level Warn -Message "The name match on $($b.BridgeKey) joined $(@($b.UserKeys).Count) account(s) across $(@($b.ForestKeys).Count) directories. One person with that many accounts is possible, and so is a name collision. Verify it, or exclude it with -ExcludeBridgeUpn."
     }
 
     foreach ($g in @($validation.CoverageGaps)) {
-        Write-ReportLog -Level Warn -Message ("No export covers {0:yyyy-MM-dd} to {1:yyyy-MM-dd}. Figures spanning that period are a lower bound, not a count." -f $g.FromUtc, $g.ToUtc)
+        Write-ReportLog -Level Warn -Message ([string]::Format([System.Globalization.CultureInfo]::InvariantCulture, "No export covers {0:yyyy-MM-dd} to {1:yyyy-MM-dd}. Figures spanning that period are a lower bound, not a count.", $g.FromUtc, $g.ToUtc))
     }
 
     return (New-ConsolidatedDataset -Validation $validation -Identity $identity)
@@ -9619,7 +10526,7 @@ function Read-ReportRunFolder {
         if ($hasCombined) {
             $failed = 'consolidated-identity-map.csv'
             $index = @{}
-            foreach ($row in @(Import-Csv -LiteralPath $combinedPath -ErrorAction Stop)) {
+            foreach ($row in @(ConvertFrom-CsvSafeRows (Import-Csv -LiteralPath $combinedPath -ErrorAction Stop))) {
                 $key = [string] $row.UserKey
                 if ([string]::IsNullOrWhiteSpace($key)) { continue }
                 $index[$key] = @{ Pseudonym = [string] $row.Pseudonym; MatchedBy = [string] $row.MatchedBy }
@@ -9627,7 +10534,7 @@ function Read-ReportRunFolder {
             $combinedIndex = $index
         } elseif ($hasMap) {
             $failed = 'identity-map.csv'
-            $identity = @(Import-Csv -LiteralPath $mapPath -ErrorAction Stop)
+            $identity = @(ConvertFrom-CsvSafeRows (Import-Csv -LiteralPath $mapPath -ErrorAction Stop))
         }
 
         $run.Identity = $identity
@@ -9831,7 +10738,7 @@ function Get-ReportRunSessions {
             # is half-written. A row cut short reads its missing cells as
             # $null, where a real open session has a blank EndUtc: without
             # this check a truncated last row would count as still open.
-            $rows = @(Import-Csv -LiteralPath $csvPath -ErrorAction Stop)
+            $rows = @(ConvertFrom-CsvSafeRows (Import-Csv -LiteralPath $csvPath -ErrorAction Stop))
             if ($rows.Count -eq 0) { throw 'empty' }
             foreach ($r in $rows) {
                 if ($null -eq $r.UserId -or $null -eq $r.EndUtc -or
@@ -10412,7 +11319,7 @@ function Get-FindUserPageFileName {
     [OutputType([string])]
     param([datetime] $Now = (Get-Date))
 
-    return ('user-check-{0:yyyyMMdd-HHmm}.html' -f $Now)
+    return [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, 'user-check-{0:yyyyMMdd-HHmm}.html', $Now)
 }
 
 function Save-FindUserPage {
@@ -14606,7 +15513,7 @@ function Invoke-ReportRun {
     # the dialog now stays open and can sit idle for any length of time
     # before Run is clicked, so a GUI run's output directory is named for
     # when the run happened, not when the process was launched.
-    $stamp = [DateTime]::Now.ToString('yyyyMMdd-HHmmss')
+    $stamp = [DateTime]::Now.ToString('yyyyMMdd-HHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
 
     # Declared before the try so the catch can still say how far the run got.
     # A failure after the run directory exists leaves the log inside it, and
@@ -14759,7 +15666,8 @@ function Invoke-ReportRun {
                 -ExcludeBridgeUpn ([string[]] $Config.ExcludeBridgeUpn) `
                 -SaltPath ([string] $Config.SaltPath) `
                 -IdentityMapPath ([string] $Config.IdentityMapPath) `
-                -DefaultSaltDirectory $Config.OutputPath
+                -DefaultSaltDirectory $Config.OutputPath `
+                -HideIdentifiers:([bool] $Config.Anonymize)
             & $emitPhase 'Load exports' 'Done'
             & $emitPhase 'Match identities' 'Done'
             $activePhase = $null
@@ -14775,11 +15683,23 @@ function Invoke-ReportRun {
         } else {
             $activePhase = 'Connect'
             & $emitPhase 'Connect' 'Active'
-            $auth = New-CitrixAuthContext -Config $Config
-            & $emitPhase 'Connect' 'Done'
-            $activePhase = 'Collect'
-            & $emitPhase 'Collect' 'Active'
-            $collected = Get-CitrixDataset -AuthContext $auth -Config $Config -ProgressAction $CollectAction
+            # A supplied account over plain HTTP: see
+            # Disable-CleartextHttpAuthentication. Put back whatever happens,
+            # because this is the user's own PowerShell session.
+            $basicModules = @()
+            if (-not $Config.IsCloud -and $Config.IsHttp -and $Config.Credential) {
+                $basicModules = @(Disable-CleartextHttpAuthentication)
+                Write-ReportLog -Level Debug -Message 'Basic sign-in is switched off for this run: the connection is not encrypted, and Basic would send the password as readable text.'
+            }
+            try {
+                $auth = New-CitrixAuthContext -Config $Config
+                & $emitPhase 'Connect' 'Done'
+                $activePhase = 'Collect'
+                & $emitPhase 'Collect' 'Active'
+                $collected = Get-CitrixDataset -AuthContext $auth -Config $Config -ProgressAction $CollectAction
+            } finally {
+                Restore-HttpAuthentication -Modules $basicModules
+            }
             & $emitPhase 'Collect' 'Done'
             $activePhase = $null
             $collected
@@ -14897,6 +15817,7 @@ function Invoke-ReportRun {
             $mapPath = Join-Path $runDir 'identity-map.csv'
             $opened.Add($mapPath)
             $mapRows | Export-Csv -Path $mapPath -NoTypeInformation -Encoding UTF8
+            Protect-ReportSecretFile -Path $mapPath
             [void] $opened.Remove($mapPath)
             Write-ReportLog -Level Warn -Message "Identity map written to $mapPath. Keep this file. Do not send it with the report."
         }
@@ -14933,12 +15854,14 @@ function Invoke-ReportRun {
                     if ($map -and $map.ContainsKey($r.ConsolidatedKey)) {
                         $pseudo = [string] $map[$r.ConsolidatedKey]
                     }
+                    # Every one of these but MatchedBy is read from files
+                    # other people supplied.
                     [pscustomobject]@{
-                        Pseudonym       = $pseudo
-                        ConsolidatedKey = $r.ConsolidatedKey
-                        UserKey         = $r.UserKey
-                        Site            = $r.Site
-                        SourceFile      = $r.SourceFile
+                        Pseudonym       = ConvertTo-CsvSafeText $pseudo
+                        ConsolidatedKey = ConvertTo-CsvSafeText $r.ConsolidatedKey
+                        UserKey         = ConvertTo-CsvSafeText $r.UserKey
+                        Site            = ConvertTo-CsvSafeText $r.Site
+                        SourceFile      = ConvertTo-CsvSafeText $r.SourceFile
                         MatchedBy       = $r.MatchedBy
                     }
                 }
@@ -14946,6 +15869,9 @@ function Invoke-ReportRun {
                 $labelled | Export-Csv -Path $consolidatedMapPath -NoTypeInformation -Encoding UTF8
                 [void] $opened.Remove($consolidatedMapPath)
                 Write-ReportLog -Level Info -Message "Consolidated identity map written to $consolidatedMapPath. Join its UserKey column against each site's identity-map.csv to check which accounts were treated as one person."
+                if (@($dataset.Consolidation.Inputs | Where-Object { -not [bool] $_.Anonymized }).Count -gt 0) {
+                    Write-ReportLog -Level Warn -Message "These exports were not anonymized, so $consolidatedMapPath holds real security identifiers. Keep this file. Do not send it with the report."
+                }
 
                 $bridged = @($rows | Where-Object { $_.MatchedBy -like '*UpnBridge*' })
                 if ($bridged.Count -gt 0) {
@@ -14964,7 +15890,7 @@ function Invoke-ReportRun {
         Write-ReportLog -Level Success -Message 'Report complete.'
         Write-ReportLog -Level Info -Message "  Unique users ($($widest.Days) days): $($widest.UniqueUsers)"
         Write-ReportLog -Level Info -Message "  Peak concurrent sessions : $($widest.Concurrency.Peak)"
-        Write-ReportLog -Level Info -Message "  p95 concurrent sessions  : $([math]::Round($widest.Concurrency.P95, 0))"
+        Write-ReportLog -Level Info -Message "  p95 concurrent sessions  : $(Format-ReportPercentile $widest.Concurrency.P95)"
         Write-ReportLog -Level Info -Message "  Report                   : $reportPath"
 
         if ($widest.IsTruncated) {

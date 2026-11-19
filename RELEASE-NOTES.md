@@ -1,5 +1,120 @@
 # Release notes — Citrix Usage Report Tool (CURT)
 
+## 1.16.0
+
+**Faster on large sites. No figure changes.**
+
+- **Export this site for combining is about five times faster**, and needs
+  far less memory. `merge-export.json` is now written a session at a time.
+  Before, the whole file was built in memory first, which took about
+  25 minutes for 1.5 million sessions and came close to the largest text
+  Windows PowerShell can hold. The file's contents are the same, field for
+  field.
+- The export is written under a temporary name and renamed when complete.
+  A run that is stopped or fails part-way leaves the previous export, if
+  there was one, untouched, and never leaves half a file.
+- The anonymized keys for each user are worked out faster.
+- The application breakdown uses less memory on sites with millions of
+  sessions.
+
+## 1.15.2
+
+**Accuracy**
+
+- **Application launches are counted in the period they happened in.** A
+  launch was counted whenever its session was open in the period, so a
+  desktop left running for two months put every launch of those two months
+  into the 7-day figure. The script now reads each launch's start time and
+  counts it only inside the period. "Unique users" for an application is
+  unchanged: people whose session ran it and was open in the period.
+- A connection or an application launch that Citrix returns twice, because
+  the site changed while it was being read, is counted once. Sessions
+  already were.
+
+**Large sites**
+
+- **About half the memory while reading.** Each page of results is converted
+  to what the report keeps as it arrives. Before, the script held every raw
+  record and every converted one together: about 4.4 GB for each million
+  sessions.
+- Two session fields that nothing used are no longer requested, so every
+  page of sessions is smaller.
+- Connections and application launches from before the period (they belong
+  to sessions still open in it) are read a day at a time, like the rest.
+  Before, they were one long query, which was the slowest single read of a
+  short report on a site with long history.
+
+## 1.15.1
+
+**Accuracy**
+
+- **Fixed: a combined report counted sessions that an export saw still open
+  as running until the day the exports were combined.** Exports made on
+  1 October and combined in mid-November had every such session running for
+  six more weeks, which raised the peak and the percentiles and put those
+  users on every day of the trend. A combined report is now measured back
+  from the end of its newest export, and says so ("Data runs up to"). A
+  session open at an older export is counted up to that export's end.
+  **Combined reports made with an earlier version should be made again**; the
+  exports themselves are fine and do not need re-running.
+- **Fixed: when one session appeared in two exports of the same site, the
+  copy from whichever file was read first was kept.** If that was the older
+  export, the session stayed open even though the newer export recorded its
+  end. The copy that records the end is now kept.
+- A combined report now warns, naming the site, when a site's newest export
+  stops more than a day before the period ends. Its last days are missing, so
+  the total is a lower bound.
+- A combined report now warns when a site has accounts with no directory
+  security identifier. Those accounts cannot be matched across sites: their
+  sessions are in every concurrency figure, but they are not in the
+  unique-user total, and the report says by how many it may be low.
+- **Fixed: a dropped connection or a timeout was not retried.** Only HTTP
+  error codes were. One network blip in a long read could end the run. It is
+  now retried like any other passing fault, once the server has answered at
+  least once; a wrong host name is still reported at once.
+- **Fixed: a response that was not Monitor data** (a proxy or gateway
+  answering with a web page) was read as the last page of the query, and the
+  rest of that day's sessions were dropped with no warning. It is now asked
+  for again, and the run fails with a clear message if it keeps happening.
+- **Fixed: on a machine set to the Thai or Arabic (Saudi) calendar, the
+  dates in the query sent to Citrix carried that calendar's year**, so the
+  wrong period was asked for.
+- The business-hours peak ("Highest at any single moment") is now exact. It
+  was the highest of the 15-minute samples, so it could miss a peak between
+  two samples and show business hours below the overall peak.
+- Percentiles in the report are rounded **up** to a whole session. The report
+  says concurrency was "at or below" the figure, so 6288.1 must read 6289;
+  before, it was rounded to the nearest, and a half went to the even number.
+- `summary.csv` writes decimals with a full stop on every machine. A German
+  or French machine wrote `12,5`. It also gains `PartialCoverage`,
+  `WindowStartUtc` and `WindowEndUtc` columns, at the end.
+- `data.json` gains `DataAsOfUtc` and, for each window of a combined report,
+  `PartialCoverage`.
+
+**Security and privacy**
+
+- The link to the next page of results is no longer followed to a different
+  server. It carries the run's sign-in, and over plain HTTP a tampered
+  response could have sent that sign-in elsewhere. Only the path is taken
+  from the link; the server is always the one the run was pointed at. This
+  also helps sites behind a load balancer whose links name an internal host.
+- Over plain HTTP with a supplied account, the script no longer answers a
+  Basic sign-in request, which would send the password as readable text.
+- **Fixed: `-Anonymize` on a report combined from exports that were not
+  anonymized still printed real user principal names** in the list of name
+  matches and in the run log. Both now show pseudonyms. The
+  `consolidated-identity-map.csv` from such a run holds real security
+  identifiers, as it must to be useful; the log now says to keep it and not
+  send it.
+- Values written to the CSV files that begin with `=`, `+`, `-` or `@` get a
+  leading apostrophe, so a spreadsheet shows them as text and does not run
+  them as a formula. Find a user reads them back unchanged.
+- The key file (`anonymization-salt.txt`) and `identity-map.csv` are now
+  readable only by the person who created them, the system and
+  administrators, wherever the output folder is.
+- One damaged file no longer stops a whole combine: a merge export with an
+  unreadable version or window is rejected by name and the rest carry on.
+
 ## 1.15.0
 
 **Faster on large sites**
